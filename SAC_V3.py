@@ -2,22 +2,25 @@
 import os
 import random
 import re
+import struct
 import time
 from copy import deepcopy
+from queue import Queue
+from threading import Lock
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import pynvml
+import serial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import wandb
 from spikingjelly.activation_based import (functional, layer, learning, neuron,
                                            surrogate)
 from tqdm import tqdm
-
-import wandb
 
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 pynvml.nvmlInit()
@@ -38,6 +41,61 @@ def compute_phase_shift(back_leg,front_leg,back_contact,front_contact):
     E_b=nrmse(np.roll(back_leg,int(phi_b//2)),front_leg)
     E_ps=.5*E_f+.5*E_b
     return E_ps
+### FIFO Buffer for circuit stuff
+class CircuitCommunicator:
+    def __init__(self,port='/dev/tty6',baudrate=115200):### change port and baudrate
+        self.serial_lock=Lock()
+        self.input_buffer=Queue(maxsize=1024) #FIFO for pc to circuit states
+        self.output_buffer=Queue(maxsize=1024) #FIFO for circuit to pc action result
+
+        self.ser=serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=.1,
+        )
+    def float_to_bytes(self,value):
+        return struct.pack('f',value)
+    def bytes_to_float(self,byte_data):
+        return struct.unpack('f',byte_data)[0]
+    def send_state(self,state):
+        self.input_buffer.put(state)
+    def recieve_action(self):
+        return self.output_buffer.get()
+    def serial_thread(self):
+        while True:
+            if not self.input_buffer.empty():
+                state=self.input_buffer.get()
+                with self.serial_lock:
+                    self.ser.write(len(state).to_bytes(4,'big'))
+                    for val in state:
+                        self.ser.write(self.float_to_bytes(val))
+            with self.serial_lock:
+                if self.ser.in_waiting>=4:
+                    action_dim=int.from_bytes(self.ser.read(4),'big')
+                    bytes_needed=action_dim*4
+                    while self.ser.in_waiting<bytes_needed:
+                        time.sleep(0.001)
+                    action_bytes=self.ser.read(bytes_needed)
+                    action=[self.bytes_to_float(action_bytes[i:i+4]) for i in range(0,len(action_bytes),4)]
+                    self.output_buffer.put(action)
+
+class ExternalActorWrapper(nn.Module):
+    def __init__(self,communicator):
+        super().__init__()
+        self.communicator=communicator
+        self.action_dim=4
+        self.timeout=1.0 ##seconds
+    def forward(self,state):
+        if isinstance(state,torch.Tensor):
+            state=state.cpu().numpy()
+        self.communicator.send_state(state)
+        start_time=time.time()
+        while self.communicator.output_buffer.empty():
+            if time.time()-start_time>self.timeout:
+                raise TimeoutError("No actor circuit response")
+            time.sleep(.001)
+        action=self.communicator.recieve_action()
+        return torch.tensor(action,dtype=torch.float32,device=device)
 
 ###FIFO replay buffer to store and sample data for policy
 class ReplayBuffer:
@@ -192,6 +250,7 @@ class Agent:
         if seed is not None:
             self.seed=seed
             self.set_seed(seed)
+        self.communicator=CircuitCommunicator()
         self.state_dim=self.env.observation_space.shape[0]
         self.action_dim=self.env.action_space.shape[0]
         self.action_bound=self.env.action_space.high[0]
@@ -202,7 +261,7 @@ class Agent:
         self._alpha=.2
         self.hidden_dim=hidden_dim 
         self.hidden_dim2=hidden_dim2
-        self.actor=Actor(self.state_dim,self.action_dim,self.action_bound,hidden_dim,hidden_dim2,SAN=self.SAN).to(device)
+        self.actor=ExternalActorWrapper(self.communicator).to(device)
         self.critic=Critic(self.state_dim,self.action_dim,hidden_dim,hidden_dim2).to(device)
         self.target_critic=deepcopy(self.critic).to(device)
         self.actor_optimizer=optim.Adam(self.actor.parameters(),lr=self.learning_rate)
@@ -216,6 +275,11 @@ class Agent:
         self.hip_back=[]
         self.front_contact=[]
         self.back_contact=[]
+        self.serial_thread=threading.Thread(
+            target=self.communicator.serial_thread,
+            daemon=True,
+        )
+        self.serial_thread.start()
     #######Getter and Setters for hyperparameters#######
     @property
     def tau(self):
