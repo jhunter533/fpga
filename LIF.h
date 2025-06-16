@@ -3,20 +3,26 @@
 
 #include <ap_fixed.h>
 
-#define CONNECTIONS 16
-#define THRESHOLD 1.0
+#define INPUTSIZE 3
+#define HIDDENDIM1 64
+#define HIDDENDIM2 64
+#define OUTPUTSIZE 1
 
 typedef ap_fixed<16,8> fixed_t;
 
 void lifNeuron(
-  fixed_t inputs[CONNECTIONS],
-  fixed_t weights[CONNECTIONS],
+  fixed_t inputs[],
+  fixed_t weights[],
   fixed_t &membranePotential,
   bool &spikeOut,
-  fixed_t leak=2.,
-  fixed_t spikeThreshold=THRESHOLD
+  fixed_t leak,
+  fixed_t spikeThreshold
 );
 
-#include <hls_stream.h>
-void lifTop(hls::stream<fixed_t> &input_stream, hls::stream<fixed_t> &weight_stream,hls::stream<bool> &output_stream,fixed_t &membrane_state);
+void outputNeuron(
+  fixed_t inputs[],
+  fixed_t weights[],
+  fixed_t &output,
+  fixed_t leak
+);
 #endif // !LIF_H
