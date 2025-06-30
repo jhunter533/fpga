@@ -1,28 +1,26 @@
-#####Includes######
-import logging
+####Includes####
 import os
 import random
 import re
-import struct
-import threading
 import time
 from copy import deepcopy
-from queue import Queue
-from threading import Lock
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import pynvml
-import serial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import wandb
+from spikingjelly.activation_based import (functional, layer, learning, neuron,
+                                           surrogate)
 from tqdm import tqdm
 
+##cude
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+##global declarations for logging
 pynvml.nvmlInit()
 gpu_index = 0
 
@@ -41,6 +39,7 @@ def compute_phase_shift(back_leg,front_leg,back_contact,front_contact):
     E_b=nrmse(np.roll(back_leg,int(phi_b//2)),front_leg)
     E_ps=.5*E_f+.5*E_b
     return E_ps
+
 ###FIFO replay buffer to store and sample data for policy
 class ReplayBuffer:
     def __init__(self,memory_capacity=int(2e6),batch_size=256,num_actions=4,num_states=24):
@@ -72,138 +71,6 @@ class ReplayBuffer:
         dones = torch.tensor(self.done_buffer[indices], dtype=torch.float32, device=device, requires_grad=False)
         return states,actions,rewards,next_states,dones
 
-
-### FIFO Buffer for circuit stuff
-class CircuitCommunicator:
-    def __init__(self,port,baudrate=115200,timeout=1.0):### change port and baudrate
-        self.serial_lock=Lock()
-        self.input_buffer=Queue(maxsize=1024) #FIFO for pc to circuit states
-        self.output_buffer=Queue(maxsize=1024) #FIFO for circuit to pc action result
-        self.port=port
-        self.baudrate=baudrate
-        self.timeout=timeout
-        self.logger=logging.getLogger('CircuitComms')
-
-        self.ser=serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=.1,
-        )
-        self._running=threading.Event()
-        self._thread=None
-    def start(self):
-        if not self.ser.is_open:
-            self.ser.open()
-        self._running.set()
-        self._thread=threading.Thread(target=self._communication_loop)
-        self._thread.daemon=True
-        self._thread.start()
-    def stop(self):
-        self._running.clear()
-        if self._thread:
-            self._thread.join()
-        self.ser.close()
-    def _pack_state(self,state):
-        ##convert numpy arr to byte stream
-        return struct.pack(f'!I?{len(state)}f',len(state),training,*state)
-    def _unpack_action(self,data):
-        action_dim = struct.unpack('!I', data[:4])[0]
-        training_flag = struct.unpack('!?', data[4:5])[0]
-        
-        if training_flag:
-            log_prob = struct.unpack('!f', data[5:9])[0]
-            action = struct.unpack(f'!{action_dim}f', data[9:])
-            return np.array(action), log_prob
-        else:
-            action = struct.unpack(f'!{action_dim}f', data[5:])
-            return np.array(action), 0.0
-
-    def _communication_loop(self):
-       while self._running.is_set():
-            try:
-                # Send data
-                if not self.input_buffer.empty():
-                    state, training = self.input_buffer.get()
-                    packed = self._pack_state(state, training)
-                    self.ser.write(packed)
-
-                # Receive data
-                if self.ser.in_waiting >= 4:
-                    header = self.ser.read(4)
-                    action_dim = struct.unpack('!I', header)[0]
-                    
-                    # Determine remaining bytes
-                    if self.ser.in_waiting >= 1:
-                        flag_byte = self.ser.read(1)
-                        training_flag = struct.unpack('!?', flag_byte)[0]
-                        bytes_needed = action_dim * 4 + (4 if training_flag else 0)
-                        
-                        # Read remaining data
-                        data = bytearray()
-                        start_time = time.time()
-                        while len(data) < bytes_needed:
-                            if time.time() - start_time > self.timeout:
-                                raise TimeoutError
-                            data += self.ser.read(bytes_needed - len(data))
-                            
-                        # Unpack and store
-                        action, log_prob = self._unpack_action(header + flag_byte + data)
-                        self.output_buffer.put((action, log_prob))
-                        
-            except Exception as e:
-                self.logger.error(f"Communication error: {e}")
-                self.reset_connection()
-
-    def send_state(self, state, training=False):
-        """Queue state for transmission with training flag"""
-        if isinstance(state, torch.Tensor):
-            state = state.cpu().numpy()
-        self.input_buffer.put((state.astype(np.float32), training))
-
-    def get_action(self):
-        """Get action and log_prob from FPGA"""
-        try:
-            return self.output_buffer.get(timeout=self.timeout)
-        except queue.Empty:
-            raise TimeoutError("No response from FPGA")
-
-    def reset_connection(self):
-        self.stop()
-        time.sleep(1)
-        self.ser = serial.Serial(self.port, self.baudrate)
-        self.start()
-
-class HardwareActor(nn.Module):
-    def __init__(self,communicator,action_dim=4,action_bound=1.0):
-        super().__init__()
-        self.communicator=communicator
-        self.action_dim=action_dim
-        self.action_bound=action_bound
-        self.timeout=1
-        self.training_mode=False
-        self.logger=logging.getLogger('HardwareActor')
-    def forward(self,state):
-        self.communicator.send_state(state, training=True)
-        action, log_prob = self.communicator.get_action()
-        
-        return (
-            torch.tensor(action, device=device) * self.action_bound,
-            torch.tensor(log_prob, device=device)
-        )
-
-    def action(self, state, det=False, SAN=False):
-        """For inference: returns deterministic action"""
-        if det:
-            self.communicator.send_state(state, training=False)
-            action, _ = self.communicator.get_action()
-            return torch.tensor(action, device=device).cpu().numpy()
-        else:
-            return self.forward(state)
-
-##Asume that 4 bytes unint32-state dimension, 1 byte bool training flag,N*4 float32 state values for pc to FPGA
-##Assumefor fpga to pc if training flag=true,  4 bytes uint32 action dim,1byte bool training flag,4 bytes float32 log prob,M*4 bytes float 32 action values
-##same for flag = false but no logstd
-
 ###Critic class with 3 fully connected layers
 class Critic(nn.Module):
     def __init__(self,num_states,num_actions,hidden_dim,hidden_dim2):
@@ -227,9 +94,98 @@ class Critic(nn.Module):
         x=self.fc3(x)
         return x
 
+###Actor class with 3 fully connected layers
+#can be used as SAC if san variable is false, can be used as SANSAC if san variable is true
+class Actor(nn.Module):
+    def __init__(self,num_states,num_actions,action_bound,hidden_dim,hidden_dim2,SAN=False):
+        super(Actor,self).__init__()
+        self.num_states=num_states
+        self.num_actions=num_actions
+        self.action_bound=action_bound
+        self.hidden_dim=hidden_dim
+        self.hidden_dim2=hidden_dim2
+        if SAN==True:
+            self.L1=nn.Sequential(
+                nn.Linear(self.num_states,self.hidden_dim),
+                neuron.LIFNode(surrogate_function=surrogate.Sigmoid(),backend='cupy'),
+                nn.Linear(self.hidden_dim,self.hidden_dim2),
+                neuron.LIFNode(surrogate_function=surrogate.Sigmoid(),backend='cupy'),
+            )
+            self.L2=nn.Sequential(
+                nn.Linear(self.hidden_dim2,self.num_actions),
+                neuron.NonSpikingLIFNode(),
+            )
+            self.L3=nn.Sequential(
+                nn.Linear(self.hidden_dim2,self.num_actions),
+                neuron.NonSpikingLIFNode(),
+            )
+            functional.set_step_mode(self.L1,step_mode='m')
+            functional.set_step_mode(self.L2,step_mode='m')
+            functional.set_step_mode(self.L3,step_mode='m')
+            self.T=16
+        else:
+            self.fc1=nn.Linear(self.num_states,self.hidden_dim)
+            self.fc2=nn.Linear(self.hidden_dim,self.hidden_dim2)
+            self.mu=nn.Linear(self.hidden_dim2,self.num_actions)
+            self.log_std=nn.Linear(self.hidden_dim2,self.num_actions)
+        self.min_log_std=-20
+        self.max_log_std=2
+        self.sp=nn.Softplus()
+    def forward(self,state,SAN=False):
+        '''
+            'state'| Input state-[(batch,num_states)]
+            'mu'| Output mean actions-[(batch,num_action)]
+            'log_std'| Output log probability-[(batch,num_action)]
+        '''
+        if isinstance(state,np.ndarray):
+            state=torch.from_numpy(state).float().to(device)
+        else:
+            state=state.to(device)
+        if SAN==True:
+            state=state.unsqueeze(0).repeat(self.T,1,1)
+            x=self.L1(state)
+            mu=self.L2(x)
+            log_std=self.L3(x)
+        else:
+            x=F.relu(self.fc1(state))
+            x=F.relu(self.fc2(x))
+            mu=self.mu(x)
+            log_std=self.log_std(x)
+        log_std=torch.clamp(log_std,self.min_log_std,self.max_log_std)
+        return mu,log_std
+    def action(self,state,det=False,SAN=False):
+        '''
+            'state'| Input state -[(batch,state_dim)]
+            'det'| User input if testing to utilize deterministic not stochastic policy-False by default
+            'action'| pi Output action to take as sampled from policy-[(batch,action_dim)]
+                ///must take just the most recent for env step
+            'log_probs| Outputs the final log probability of policy of sampled action-[(batch,action_dim)]'
+            
+        '''
+        if isinstance(state,np.ndarray):
+            state=torch.from_numpy(state).float().to(device)
+        else:
+            state=state.to(device)
+        mu,log_std=self(state,SAN)
+        if det:
+            state=torch.tensor(state,dtype=torch.float32).to(device)
+            action=self.action_bound*torch.tanh(mu)
+            return action.cpu().detach().numpy()
+        std=torch.exp(log_std)
+        normal=torch.distributions.Normal(mu,std)
+        raw_action=normal.rsample()
+        action=self.action_bound*torch.tanh(raw_action)
+        log_probs=normal.log_prob(raw_action).sum(axis=-1,keepdim=True)
+        transform=2*(np.log(2)-raw_action-self.sp(-2*raw_action)).sum(axis=-1,keepdim=True)
+        log_probs-=transform
+        if SAN==True:
+            functional.reset_net(self)
+        return action,log_probs
+
+###Agent class utilizing actor and crtic classes
 class Agent:
-    def __init__(self, env, communicator, hidden_dim=256, hidden_dim2=256, alpha=0.2, seed=None,SAN=False):
-        self.env = env
+    def __init__(self,env,hidden_dim,hidden_dim2,seed=None,SAN=False):
+        self.env=env
         self.SAN=SAN
         if self.SAN==True:
             self.arch="SANSAC"
@@ -238,111 +194,98 @@ class Agent:
         if seed is not None:
             self.seed=seed
             self.set_seed(seed)
-        
-        # Environment parameters
-        self.state_dim = env.observation_space.shape[0]
-        self.action_dim = env.action_space.shape[0]
-        self.action_bound = env.action_space.high[0]
-        
-        # Hardware integration
-        self.communicator = communicator
-        self.actor = HardwareActor(communicator, self.action_dim, self.action_bound)
-        
-        # Dual critics
-        self.critic1 = Critic(self.state_dim, self.action_dim, hidden_dim, hidden_dim2).to(device)
-        self.critic2 = Critic(self.state_dim, self.action_dim, hidden_dim, hidden_dim2).to(device)
-        self.target_critic1 = deepcopy(self.critic1).to(device)
-        self.target_critic2 = deepcopy(self.critic2).to(device)
-        
-        # Optimizers
-        self.critic_optimizer = optim.Adam(
-            list(self.critic1.parameters()) + list(self.critic2.parameters()), 
-            lr=3e-4
-        )
-        
-        # SAC parameters
-        self.alpha = alpha
-        self.tau = 0.005
-        self.gamma = 0.99
-        self.buffer = ReplayBuffer()
-        self.total_steps = 0
+        self.state_dim=self.env.observation_space.shape[0]
+        self.action_dim=self.env.action_space.shape[0]
+        self.action_bound=self.env.action_space.high[0]
+        self.buffer=ReplayBuffer(num_actions=1,num_states=3)
+        self.learning_rate=2e-4
+        self._tau=.005
+        self._gamma=.975
+        self._alpha=.2
+        self.hidden_dim=hidden_dim 
+        self.hidden_dim2=hidden_dim2
+        self.actor=Actor(self.state_dim,self.action_dim,self.action_bound,hidden_dim,hidden_dim2,SAN=self.SAN).to(device)
+        self.critic=Critic(self.state_dim,self.action_dim,hidden_dim,hidden_dim2).to(device)
+        self.target_critic=deepcopy(self.critic).to(device)
+        self.actor_optimizer=optim.Adam(self.actor.parameters(),lr=self.learning_rate)
+        self.critic_optimizer=optim.Adam(self.critic.parameters(),lr=self.learning_rate)
+        self.critic2=Critic(self.state_dim,self.action_dim,hidden_dim,hidden_dim2).to(device)
+        self.target_critic2=deepcopy(self.critic2).to(device)
+        self.critic2_optimizer=optim.Adam(self.critic2.parameters(),lr=self.learning_rate)
+        self._file_path='samplefile'
+        self.totalsteps=0
+        self.hip_front=[]
+        self.hip_back=[]
+        self.front_contact=[]
+        self.back_contact=[]
+    #######Getter and Setters for hyperparameters#######
+    @property
+    def tau(self):
+        return self._tau
+    @tau.setter
+    def tau(self,value):
+        self._tau=value
+    @property
+    def gamma(self):
+        return self._gamma
+    @gamma.setter
+    def gamma(self,value):
+        self._gamma=value
+    @property
+    def alpha(self):
+        return self._alpha
+    @alpha.setter
+    def alpha(self, value):
+        self._alpha = value
+    @property
+    def file_path(self):
+        return self._file_path
+    @file_path.setter
+    def file_path(self, value):
+        self._file_path = value
 
-    def select_action(self, state, deterministic=False):
-        with torch.no_grad():
-            if deterministic:
-                return self.actor.action(state, det=True)
-            return self.actor(state)[0].cpu().numpy()
+    def extract_number_from_filename(self, filename):
+        match = re.search(r'_(\d+)\.pth', filename)
+        if match:
+            return match.group(1)
+        return 'unknown' 
 
-    def train(self, total_timesteps=1e6):
-        state, _ = self.env.reset()
-        for _ in tqdm(range(int(total_timesteps))):
-            self.total_steps += 1
-            
-            # Collect experience
-            action, log_prob = self.actor(torch.FloatTensor(state).to(device))
-            next_state, reward, done, trunc, _ = self.env.step(action.cpu().numpy())
-            self.buffer.store(state, action.cpu().numpy(), reward, next_state, done)
-            state = next_state
-            
-            # Train after warmup
-            if self.total_steps > 1000 and self.total_steps % 50 == 0:
-                self._update_parameters()
-                
-            if done or trunc:
-                state, _ = self.env.reset()
+    def soft_update(self):
+        for target_param,param in zip(self.target_critic.parameters(),self.critic.parameters()):
+            target_param.data.copy_(self.tau*param.data+(1-self.tau)*target_param.data)
+        for target_param,param in zip(self.target_critic2.parameters(),self.critic2.parameters()):
+            target_param.data.copy_(self.tau*param.data+(1-self.tau)*target_param.data)
 
-    def _update_parameters(self):
-        states, actions, rewards, next_states, dones = self.buffer.sample()
-        
-        with torch.no_grad():
-            # Get actions from FPGA policy
-            next_actions, next_log_probs = self.actor(next_states)
-            
-            # Target Q-values
-            target_q1 = self.target_critic1(next_states, next_actions)
-            target_q2 = self.target_critic2(next_states, next_actions)
-            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
-            target_q = rewards + (1 - dones) * self.gamma * target_q
+    def select_action(self,state):
+        action,_=self.actor.action(state,SAN=self.SAN)
+        action=action.cpu().detach().numpy()
+        return action
 
-        # Critic loss
-        current_q1 = self.critic1(states, actions)
-        current_q2 = self.critic2(states, actions)
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-        
-        # Update critics
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-        
-        # Actor loss (handled implicitly through FPGA)
-        with torch.no_grad():
-            # Get new actions for logging
-            new_actions, new_log_probs = self.actor(states)
-            q1 = self.critic1(states, new_actions)
-            q2 = self.critic2(states, new_actions)
-            q = torch.min(q1, q2)
-            actor_loss = (self.alpha * new_log_probs - q).mean()
+    def save_checkpoint(self, episode):
+        checkpoint_dir = os.path.join('checkpoints',self.file_path)
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_{self.seed}_{episode}.pth')
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'critic2_state_dict': self.critic2.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'critic2_optimizer_state_dict': self.critic2_optimizer.state_dict(),
+        }, checkpoint_path)
+        print(f"Checkpoint saved at episode {episode}")
 
-        # Logging
-        wandb.log({
-            "critic_loss": critic_loss.item(),
-            "actor_loss": actor_loss.item(),
-            "alpha": self.alpha,
-            "log_probs": new_log_probs.mean().item()
-        })
-        
-        # Soft updates
-        self.soft_update(self.critic1, self.target_critic1)
-        self.soft_update(self.critic2, self.target_critic2)
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.critic2.load_state_dict(checkpoint['critic2_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.critic2_optimizer.load_state_dict(checkpoint['critic2_optimizer_state_dict'])
+        print(f"Checkpoint loaded from {checkpoint_path}")
 
-    def soft_update(self, local_model, target_model):
-        for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
-            target_param.data.copy_(
-                self.tau * local_param.data + (1.0 - self.tau) * target_param.data
-            )
-    def sync_weights_to_fpga(self):
-    #implement fpga specific weight update protocol
-        pass
     def set_seed(self,seed_value):
         random.seed(seed_value)
         np.random.seed(seed_value)
@@ -352,10 +295,157 @@ class Agent:
         torch.backends.cudnn.deterministic=True
         self.seed=seed_value
 
-##example usage:
-#comms=CircuitCommunicator(port=)
-#comms.start()
-#env=gym.make("")
-#agent=Agent(env,comms)
-#agent.train(total_timesteps=)
-#comms.stop()
+    def train(self,max_episode):
+        i=0
+        for episode in tqdm(range(max_episode)):
+            state,_=self.env.reset(seed=self.seed)
+            done=False
+            trunc=False
+            while not (done or trunc):
+                self.totalsteps+=1
+                if i >1000:
+                    action=self.select_action(state)
+                    if self.SAN==True:
+                        action=action.squeeze(0)
+                else:
+                    action=self.env.action_space.sample()
+                i+=1
+                
+                total_r=0
+                for _ in range(1):
+                    next_state,reward,done,trunc,info=self.env.step(action)
+                    total_r+=reward
+                    if done:
+                        total_r=max(total_r,0.0)
+                        break
+                total_r*=5
+                
+                self.buffer.store(state,action,total_r,next_state,done)
+                states,actions,rewards,next_states,dones=self.buffer.sample()
+                rewards=torch.unsqueeze(rewards,1)
+                dones=torch.unsqueeze(dones,1)
+
+                q1=self.critic(states,actions)
+                q2=self.critic2(states,actions)
+
+                with torch.no_grad():
+                    next_action,next_log_probs=self.actor.action(next_states,SAN=self.SAN)
+                    q1_next_target=self.target_critic(next_states,next_action)
+                    q2_next_target=self.target_critic2(next_states,next_action)
+                    q_next_target=torch.min(q1_next_target,q2_next_target)
+                    value_target=rewards+(1-dones)*self.gamma*(q_next_target-self.alpha*next_log_probs)
+
+                q1_loss=((q1-value_target)**2).mean()
+                q2_loss=((q2-value_target)**2).mean()
+                self.critic_optimizer.zero_grad()
+                self.critic2_optimizer.zero_grad()
+                q1_loss.backward()
+                q2_loss.backward()
+                self.critic_optimizer.step()
+                self.critic2_optimizer.step()
+
+                self.actor_optimizer.zero_grad()
+                actions_pred,log_pred=self.actor.action(states,SAN=self.SAN)
+                q1_pred=self.critic(states,actions_pred)
+                q2_pred=self.critic2(states,actions_pred)
+                q_pred=torch.min(q1_pred,q2_pred)
+                actor_loss=(self.alpha*log_pred-q_pred).mean()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+
+                self.soft_update()
+
+                if i%1000:
+                    wandb.log({
+                              "reward":total_r,
+                              "critic_loss1":q1_loss,
+                              "critic_loss2":q2_loss,
+                              "actor_loss":actor_loss,
+                        #"Front Hip Angle": state[9],
+                        #     "Back Hip Angle": state[4],
+                        #     "Front Knee Angle": state[11],
+                        #      "Back Knee Angle": state[6],
+                                         })
+
+                if done or trunc:
+                    break
+                state=next_state
+            if episode%50==0:
+                self.save_checkpoint(episode)
+
+    def test_digital(self):
+        state,_=self.env.reset()
+        total_reward=0
+        start_time=time.time()
+        done=False
+        trunc=False
+        step=0
+        while not (done or trunc):
+            action=self.actor.action(state,det=True,SAN=self.SAN)
+            if self.SAN==True:
+                action=action.squeeze(0)
+            next_state,reward,done,trunc,_=self.env.step(action)
+            #self.hip_back.append(state[4])
+            #self.hip_front.append(state[9])
+            #self.front_contact.append(state[13])
+            #self.back_contact.append(state[8])
+            state=next_state
+            total_reward+=reward
+            step+=1
+            wandb.log({
+                "reward":reward,
+                #   "Front Hip Angle":state[9],
+                #"Back Hip Angle":state[4],
+                #"Front Knee Angle": state[11],
+                #"Back Knee Angle": state[6],
+            })
+            if done or trunc:
+                break
+        elapsed_t=elapsed_time(start_time)
+        try:
+            E_ps=compute_phase_shift(self.hip_back,self.hip_front,self.back_contact,self.front_contact)
+        except:
+            E_ps=1
+        return total_reward,step+1,elapsed_t,E_ps
+    def eval_agent(self,num_tests=30):
+        total_reward=0
+        total_E_ps=0
+        for test in range(num_tests):
+            tot_r,tot_step,tot_time,tot_e=self.test_digital()
+            total_E_ps+=tot_e
+            total_reward+=tot_r
+            wandb.log({
+                "Total Reward":tot_r,
+                "Total Phase Shift":tot_e,
+            })
+        avg_phase_shift=total_E_ps/num_tests
+        avg_reward=total_reward/num_tests
+        wandb.log({
+            "average phase shift":avg_phase_shift,
+            "average reward":avg_reward,
+        })
+        return avg_reward
+    def _get_model_dir(self):
+        model_dir=os.path.join("Models",self._file_path)
+        if not os.path.exists(model_dir):
+            os.makedirs(model_dir)
+        return model_dir
+    def save_model(self):
+        model_dir=self._get_model_dir()
+        actor_path=os.path.join(model_dir,f'{self.seed}_actor.pth')
+        critic1_path=os.path.join(model_dir,f'{self.seed}_critic1.pth')
+        critic2_path=os.path.join(model_dir,f'{self.seed}_critic2.pth')
+        torch.save(self.actor.state_dict(),actor_path,_use_new_zipfile_serialization=True)
+        torch.save(self.critic.state_dict(),critic1_path,_use_new_zipfile_serialization=True)
+        torch.save(self.critic2.state_dict(),critic2_path,_use_new_zipfile_serialization=True)
+        print("Model Saved")
+
+    def load_model(self):
+        model_dir=self._get_model_dir()
+        actor_path=os.path.join(model_dir,f'{self.seed}_actor.pth')
+        critic1_path=os.path.join(model_dir,f'{self.seed}_critic1.pth')
+        critic2_path=os.path.join(model_dir,f'{self.seed}_critic2.pth')
+        self.actor.load_state_dict(torch.load(actor_path))
+        self.critic.load_state_dict(torch.load(critic1_path))
+        self.critic2.load_state_dict(torch.load(critic2_path))
+        print("Model Loaded")
