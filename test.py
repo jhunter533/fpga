@@ -19,8 +19,12 @@ class FPGAInterface:
 
     def float_to_fixed(self,x):
         scale=2**8
-        xClamp=torch.clamp(x,min=-128,max=127.996)
-        xInt=int(xClamp*scale)&0xFFFF
+        xVal=float(x)
+        if xVal<-128:
+            xVal=-128
+        elif xVal>127.996:
+            xVal=127.996
+        xInt=int(xVal*scale)&0xFFFF
         return xInt
 
     def fixed_to_float(self,x):
@@ -65,7 +69,7 @@ class FPGAInterface:
 
 def main():
     env=gym.make("Pendulum-v1",render_mode='human')
-    fpga=FPGAInterface('/dev/tty6')#check usb port
+    fpga=FPGAInterface('/dev/ttyUSB1')#check usb port
     numEpisodes=1000
     gamma=.99
 

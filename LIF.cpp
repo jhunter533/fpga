@@ -4,10 +4,10 @@ fixed_t sigmoidSurrogate(fixed_t x) {
 #pragma HLS INLINE
   fixed_t xScaled = SIGMOIDSCALE * 4.0;
   fixed_t expVal = hls::exp(-xScaled);
-  return (1.0) / (1.0 + expVal);
+  return fixed_t(1.0) / (fixed_t(1.0) + expVal);
 }
 void lifNeuron(fixed_t inputs[], fixed_t weights[], fixed_t &membranePotential,
-               bool &spikeOut, fixed_t leak, fixed_t spikeThreshold) {
+               fixed_t &spikeOut, fixed_t leak, fixed_t spikeThreshold) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS ARRAY_PARTITION variable = inputs cyclic factor = 16
 #pragma HLS ARRAY_PARTITION variable = weights cyclic factor = 16

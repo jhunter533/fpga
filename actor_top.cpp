@@ -5,6 +5,7 @@
 #include <hls_stream.h>
 #include <memory>
 #include <string.h>
+#include <hls_math.h>
 
 #define DWIDTH 32
 typedef ap_axiu<DWIDTH, 0, 0, 0> axis_t;
@@ -13,7 +14,7 @@ void fpgaActor(hls::stream<axis_t> &inStream, hls::stream<axis_t> &outStream) {
 
 #pragma HLS INTERFACE axis port = inStream
 #pragma HLS INTERFACE axis port = outStream
-#pragma HLS INTERFACE s_axilite port = return
+#pragma HLS INTERFACE ap_ctrl_none port = return
 
   static fixed_t leak = 0.5;
   static fixed_t threshold = 1.0;
@@ -28,15 +29,7 @@ void fpgaActor(hls::stream<axis_t> &inStream, hls::stream<axis_t> &outStream) {
   static fixed_t w2[HIDDENDIM2][HIDDENDIM1];
   static fixed_t w3[OUTPUTSIZE][HIDDENDIM2];
 
-  static bool weightsInit = false;
-  if (!weightsInit) {
-    weightsInit = true;
-    for (int i = 0; i < HIDDENDIM1; i++) {
-      for (int j = 0; j < INPUTSIZE; j++) {
-        w1[i][j] = (fixed_t)((rand() % 2000 - 1000) / 1000.0);
-      }
-    }
-  }
+
 #pragma HLS BIND_STORAGE variable = w1 type = ram_2p impl = bram
 #pragma HLS BIND_STORAGE variable = w2 type = ram_2p impl = bram
   axis_t cmdPkt = inStream.read();
@@ -47,6 +40,9 @@ void fpgaActor(hls::stream<axis_t> &inStream, hls::stream<axis_t> &outStream) {
 #pragma HLS PIPELINE II = 1
       axis_t val = inStream.read();
       state[i] = *reinterpret_cast<fixed_t *>(&val.data);
+      fixed_t stateVal;
+      stateVal.V=val.data;
+      state[i]=stateVal;
     }
     fixed_t action;
     actorForward(state, action, w1, w2, w3, mem1, mem2, memOut, spikes1,

@@ -115,8 +115,8 @@ void actorForward(fixed_t state[INPUTSIZE], fixed_t &action,
                   fixed_t spikes1[HIDDENDIM1], fixed_t spikes2[HIDDENDIM2],
                   fixed_t leak, fixed_t threshold) {
 #pragma HLS DATAFLOW
-#pragma HLS ARRAY_PARTITION variable = w1 cyclic factor = 16 dim = 1
-#pragma HLS ARRAY_PARTITION variable = w2 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w1 cyclic factor = 16 dim = 2
+#pragma HLS ARRAY_PARTITION variable = w2 cyclic factor = 8 dim = 2
 #pragma HLS ARRAY_PARTITION variable = w3 complete dim = 0
 #pragma HLS ARRAY_PARTITION variable = mem1 cyclic factor = 16
 #pragma HLS ARRAY_PARTITION variable = mem2 cyclic factor = 8
@@ -128,7 +128,7 @@ void actorForward(fixed_t state[INPUTSIZE], fixed_t &action,
   layer1Forward(state, w1, mem1, spikes1, leak, threshold);
   layer2Forward(spikes1, w2, mem2, spikes2, leak, threshold);
   outputForward(spikes2, w3, memOut, leak);
-  action = 4.0 * memOut[0] - 2.0;
+  action = fixed_t(4.0) * memOut[0] - fixed_t(2.0);
 }
 
 void actorBackward(fixed_t state[INPUTSIZE], fixed_t dAction,
@@ -146,7 +146,6 @@ void actorBackward(fixed_t state[INPUTSIZE], fixed_t dAction,
 #pragma HLS ARRAY_PARTITION variable = w3 complete dim = 0
 #pragma HLS ARRAY_PARTITION variable = mem1 cyclic factor = 16
 #pragma HLS ARRAY_PARTITION variable = mem2 cyclic factor = 8
-#pragma HLS ARRAY_PARTITION variable = memOut complete
 #pragma HLS ARRAY_PARTITION variable = spikes1 cyclic factor = 16
 #pragma HLS ARRAY_PARTITION variable = spikes2 cyclic factor = 8
 #pragma HLS ARRAY_PARTITION variable = state complete
@@ -154,7 +153,7 @@ void actorBackward(fixed_t state[INPUTSIZE], fixed_t dAction,
 #pragma HLS ARRAY_PARTITION variable = w2D cyclic factor = 8 dim = 1
 #pragma HLS ARRAY_PARTITION variable = w3D complete dim = 0
 
-  fixed_t memOutD = dAction * 4.0;
+  fixed_t memOutD = fixed_t(dAction) * fixed_t(4.0);
   fixed_t spikeIn3D[HIDDENDIM2] = {0};
   fixed_t spikes2D[HIDDENDIM2] = {0};
   fixed_t spikes1D[HIDDENDIM1] = {0};
