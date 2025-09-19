@@ -12,6 +12,8 @@
 
 #define SIGMOIDSCALE 4.0
 #define SIGMOIDSHIFT 2.0
+#define MINLOG -20.0
+#define MAXLOG 2.0
 typedef ap_fixed<16, 8> fixed_t;
 
 void lifNeuron(fixed_t inputs[], fixed_t weights[], fixed_t &membranePotential,
@@ -21,4 +23,5 @@ void outputNeuron(fixed_t inputs[], fixed_t weights[], fixed_t &output,
                   fixed_t leak);
 
 fixed_t sigmoidSurrogate(fixed_t x);
+fixed_t clampLog(fixed_t value);
 #endif // !LIF_H
