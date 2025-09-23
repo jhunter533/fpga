@@ -1,0 +1,145 @@
+For Bipedal Walker Highest Dimensions
+Layers:
+- input Layer: 24
+- Hidden 1: 296
+- Hidden 2: 299
+- Output Layer: 4
+Total parameters: roughly 97k in 32 bit floats
+using 16 bit fixed-point would reduce
+
+Memory:
+(24*296+296)*2 bytes=14,800B
+(296*299+299)*2 bytes=177,606 B
+(299*4+4)*2 bytes=2400B
+Total=194.8KB (16 bit)
+Activation Mem Buffer:
+24*16=48B
+296*16=592B
+299*16=598B
+4*16=8B
+
+MAC Estimates:
+
+We have 3650 slices containing four 6 input LUTs and 8 flip flops
+1620 Kbits of fast block RAM
+80 DSP slices
+
+->
+80 MACs
+202.5 total KB BRAM
+3650 slices
+
+->
+Layer|Inputs|MAC Units Allocated|Cycles per Neuron|Total Cycles
+1|24|24|1|296
+2|296|80|4|299*4=1196
+3|299|80|4|4*4=16
+Total||||1508 cycles
+
+All dsps active in 2nd and 3rd layers
+
+Total BRAM usage
+Weight+biases->194.8KB 
+Activation Buffer->1.2KB
+Total->196KB< 202.5KB BRAM (roughly all of the BRAM though at max but we can lower it)
+
+So we need to focus on 16 bit fixed point and packing data efficiently
+
+We can reuse activation buffer (such as overwriting input buffer after layer 1)
+We can split large weight matrices across multiple bram blocks?
+
+Slice Estimation:
+MAC control ->80 slices ----> 1 slice per DSP
+Activation Units -> 200 slices---> ReLU, tanH (LUT-based approx),Look up table approx
+FSM->500 slices ----->layer sequencing, weight loading
+
+DSP slices formula
+Number of dsps=mac operations per layer *parallelism factor
+ex:
+cycles per neuron=ceil(296/80)=4 cycles
+299 neurons*4 cycles=1196 cycles
+
+BRAM formula
+BRAM(bits)=(weights+biases+activations)*bit width
+ex:
+24*296*16=113,664 bits (14.2KB)
+
+LUTs per slice depends on arch: in my case 4LUT 8 flipflops
+LUT Usage:
+1 LUT per DSP
+ReLU,tanh 50-100 (asked deepseek) so probs google
+
+flipflop ussage- 1FF per bit, 16 FFs used in 16 bit activation buffer
+
+
+LUT is Look Up Table->configuation truth table implementing combinational logic, used for logic gates,small arithmetic,multiplexerss
+
+FF is 1 bit storage element (register) that holds state (pipeline registers), used for storing intermediate values in sequential logic (buffering neural activations)
+
+Slice is basic building block of FPGA, used to combine to create larger logic blocks (adders, state machines), (implementing 16 bit adder requires 16 LUTS 16 FFs (4 slices))
+
+ZYNQ vs ARTIX: 
+ZYNQ is fpga with arm cpu, programmed with jupyter/python,shared ddr ram + bram,rapid prototyping with cpu control,prebuilt overlays, easier to use
+ARTIX (mine) is fpga with no cpu, uses HDL (Vitis cpp hls), on chip bram only, low-level hardware accelerration, vitis/vivado,higher throughput cause more low-level
+
+MAC is 16 bit multiplier accumulator
+multiplier 16 dsp or 256 LUTS (if logic less preff)
+accumulator 32 bit adder which is 32 LUTs + 32 FFs (8-16 slices roughly)
+
+To help layer 2 bottleneck use 16 bit quantization to avoid overflow
+
+For SNN on the fpga-> we need to use spike firing+ membrane potential dynamics over activation functions, it also uses binary spikes of 1 bit + membrane potentials of 8-16 bits, also more temporal steps, 
+
+time steps:16
+forward pass uses LIF
+backward uses surrogate gradient
+data type 16 bit fixed point
+
+math estimates for LIF
+for each neuron at time step t in the forward pass
+  Leakage
+  Integration
+  Threshold
+  Reset
+Surrogate gradient back pass
+foward binary spike Sout
+backward approx gradient with sigmoid
+
+(MAC)
+Leakage: 1 DSP per neuron (multiplication)
+Integration: MAC(summing weighted spikes)
+Surrogate Gradients: Add Sigmoid (LUT)
+(BRAM)
+Membrane Potentials:296+299+4=599 neurons *16 bit *16 time step=2.4KB
+Spike Buffer:
+24*1*16=384 bits (48B) for input
+(hidden/output)=599*16=1.2KB
+sigmoid 16 in 16 out -> 64KB if stored
+196KB +2.4KB +1.2KB+64KB=263.6KB
+LIF ->500LUTS
+idk like not all the slices used
+
+with the RNN nature we are gonna need a bigger fpga
+it's gonna use like twice the slices of ANN but not all of cmod s7
+
+need minimum of 265KB BRAM
+1500 slices
+80 DSP
+
+zynq xc72007s
+
+xc7s50
+xc7s75
+su65P
+su55P
+AU7P
+ZU1CG
+xc7z015
+
+ZU 1CG FPGA:https://www.newark.com/avnet-engineering-services/aes-zub-1cg-dk-g/development-board-arm-cortex-a53/dp/41AK2454
+
+XC7Z015 FPGA:https://www.myyirtech.com/list.asp?id=553
+
+XC7S50 FPGA: https://www.digikey.com/en/products/detail/digilent-inc/410-352/7602775
+
+
