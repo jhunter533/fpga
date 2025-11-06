@@ -1,8 +1,9 @@
 import asyncio
 import socket
 
+
 async def test_fpga_connection():
-    host='192.168.2.5'
+    host='192.168.1.10'
     port=8888
     try:
         reader,writer=await asyncio.open_connection(host,port)
