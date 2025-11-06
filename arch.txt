@@ -1,0 +1,22 @@
+ZU1CG
+->PS: TCP Server, Communication
+->PL: SNN computation HLS
+->AXI Interfaces connecting PS to PL
+
+Block Diagram:
+  zu1cg->zynq module
+  SNN HLS:
+    AXI stream interface (stateIn,actionOut,logprobOut)
+    AXI something for weight updates
+  AXI Bram controller and bram(unsure if its already part of default setup)
+  AXI Interconnect (PS to SNN) (unsure if already part of default)
+
+
+so how to do the stream interface for real time data flow
+how to do the bram
+how to connect everything
+how to weight load
+how to initialize all additional blocks in the application code
+how to get right addresses for application code
+
+all this above has  to export the bitstream from Vivado into Vitis and we run TCP server application in Vitis to fpga
