@@ -9,6 +9,7 @@
 #include "xil_printf.h"
 #include "xparameters.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -19,9 +20,9 @@ extern volatile int TcpSlowTmrFlag;
 struct netif *app_netif;
 static struct netif server_netif;
 struct netif *echo_netif;
+
 static unsigned int simple_rand_state = 12345;
 
-// to be changeed later dont worry about it right now
 int simple_rand() {
   simple_rand_state = simple_rand_state * 1103515245 + 12345;
   return (unsigned int)(simple_rand_state / 65536) % 32768;
@@ -32,15 +33,10 @@ void tcp_slowtmr(void);
 
 #define TCP_PORT 12345
 #define NUM_STATES 3
-#define HIDDEN1_SIZE 128
-#define HIDDEN2_SIZE 64
+#define HIDDEN1_SIZE 64
+#define HIDDEN2_SIZE 32
 #define NUM_ACTIONS 1
 #define TIME_STEPS 5
-
-// Fixed-point arithmetic
-#define FIXED_POINT_SCALE 65536.0f
-#define FIXED_TO_FLOAT(x) ((float)(x) / FIXED_POINT_SCALE)
-#define FLOAT_TO_FIXED(x) ((int)((x) * FIXED_POINT_SCALE))
 
 // LIF Neuron parameters
 #define V_THRESHOLD 1.0f // Fixed point: 1.0
@@ -52,15 +48,15 @@ void tcp_slowtmr(void);
 #define LEARNING_RATE .001f // Fixed point: 0.3
 
 // Network weights
-static int fc1_weights[HIDDEN1_SIZE][NUM_STATES];
-static int fc2_weights[HIDDEN2_SIZE][HIDDEN1_SIZE];
-static int mu_weights[NUM_ACTIONS][HIDDEN2_SIZE];
-static int logstd_weights[NUM_ACTIONS][HIDDEN2_SIZE];
+static float fc1_weights[HIDDEN1_SIZE][NUM_STATES];
+static float fc2_weights[HIDDEN2_SIZE][HIDDEN1_SIZE];
+static float mu_weights[NUM_ACTIONS][HIDDEN2_SIZE];
+static float logstd_weights[NUM_ACTIONS][HIDDEN2_SIZE];
 
-static int fc1_bias[HIDDEN1_SIZE];
-static int fc2_bias[HIDDEN2_SIZE];
-static int mu_bias[NUM_ACTIONS];
-static int logstd_bias[NUM_ACTIONS];
+static float fc1_bias[HIDDEN1_SIZE];
+static float fc2_bias[HIDDEN2_SIZE];
+static float mu_bias[NUM_ACTIONS];
+static float logstd_bias[NUM_ACTIONS];
 
 // Gradient matrices
 static float fc1_grad[HIDDEN1_SIZE][NUM_STATES];
@@ -97,19 +93,35 @@ static float hidden2_spikes[TIME_STEPS][HIDDEN2_SIZE];
 static float hidden1_inputs[TIME_STEPS][HIDDEN1_SIZE];
 static float hidden2_inputs[TIME_STEPS][HIDDEN2_SIZE];
 
-// Initialize random number generator
-static unsigned int simple_rand_state = 12345;
+static float stored_action[NUM_ACTIONS];
+static float stored_log_prob[NUM_ACTIONS];
 
-int simple_rand() {
-  simple_rand_state = simple_rand_state * 1103515245 + 12345;
-  return (unsigned int)(simple_rand_state / 65536) % 32768;
+static float stored_mu_grad_output[NUM_ACTIONS];
+static float stored_logstd_grad_output[NUM_ACTIONS];
+
+float fast_exp_neg(float x) {
+  if (x > 10.0f)
+    return 0.000045f; // e^(-10)
+  if (x < -10.0f)
+    return 22026.47f; // e^10
+  // Taylor series: e^x = 1 + x + x^2/2! + x^3/3! + ...
+  float result = 1.0f;
+  float term = 1.0f;
+  for (int i = 1; i <= 8; i++) {
+    term *= x / i;
+    result += term;
+  }
+  return result;
 }
+
+// Fast absolute value
+float fast_fabs(float x) { return x > 0 ? x : -x; }
 
 // Surrogate gradient function
 float surrogate_gradient(float membrane_voltage, float threshold) {
   float x = membrane_voltage - threshold;
   float k = 0.5f; // Steepness parameter
-  return k * expf(-fabsf(x));
+  return k * fast_exp_neg(-fast_fabs(x));
 }
 
 // Fast tanh approximation
@@ -129,10 +141,10 @@ float fast_tanh_derivative(float x) {
 
 // LIF neuron update
 int update_lif_neuron(lif_neuron_t *neuron, float input) {
-  float decay = expf(-DT / neuron->tau_membrane);
+  float decay = .9512;
   neuron->voltage_trace = neuron->v_membrane * decay + input;
 
-  if (neuron->voltage_trace >= neuron->threshold) {
+  if (neuron->voltage_trace >= neuron->v_threshold) {
     neuron->spike_trace = 1.0f;
     neuron->v_membrane = 0.0f; // Reset
     return 1;                  // Spike
@@ -145,12 +157,12 @@ int update_lif_neuron(lif_neuron_t *neuron, float input) {
 
 // LI neuron update (for continuous output)
 float update_li_neuron(li_neuron_t *neuron, float input) {
-  float decay = expf(-DT / neuron->tau_membrane);
+  float decay = .9512f;
   neuron->v_membrane = neuron->v_membrane * decay + input;
   return neuron->v_membrane;
 }
 
-void matrix_multiply(const int *weights, const float *input, float *output,
+void matrix_multiply(const float *weights, const float *input, float *output,
                      int rows, int cols) {
   // Use loop unrolling to reduce loop overhead
   for (int i = 0; i < rows; i++) {
@@ -191,14 +203,14 @@ void snn_forward_pass(const float *state, float *action, float *log_prob) {
     lif1_neurons[i].v_membrane = 0.0f;
     lif1_neurons[i].voltage_trace = 0.0f;
     lif1_neurons[i].spike_trace = 0.0f;
-    lif1_neurons[i].threshold = V_THRESHOLD;
+    lif1_neurons[i].v_threshold = V_THRESHOLD;
     lif1_neurons[i].tau_membrane = TAU_MEMBRANE;
   }
   for (int i = 0; i < HIDDEN2_SIZE; i++) {
     lif2_neurons[i].v_membrane = 0.0f;
     lif2_neurons[i].voltage_trace = 0.0f;
     lif2_neurons[i].spike_trace = 0.0f;
-    lif2_neurons[i].threshold = V_THRESHOLD;
+    lif2_neurons[i].v_threshold = V_THRESHOLD;
     lif2_neurons[i].tau_membrane = TAU_MEMBRANE;
   }
   for (int i = 0; i < NUM_ACTIONS; i++) {
@@ -254,7 +266,12 @@ void snn_forward_pass(const float *state, float *action, float *log_prob) {
     log_prob[i] =
         logstd_val > 2.0f ? 2.0f : (logstd_val < -20.0f ? -20.0f : logstd_val);
   }
+  for (int i = 0; i < NUM_ACTIONS; i++) {
+    stored_action[i] = action[i];
+    stored_log_prob[i] = log_prob[i];
+  }
 }
+
 void snn_backward_pass(const float *state, const float *action_grad,
                        const float *logprob_grad) {
   // Initialize gradients to zero
@@ -282,8 +299,9 @@ void snn_backward_pass(const float *state, const float *action_grad,
   // Calculate gradients for output layer
   for (int i = 0; i < NUM_ACTIONS; i++) {
     // Derivative of tanh for action
-    float mu_grad_output = action_grad[i] * fast_tanh_derivative(action[i]);
-    float logstd_grad_output = logprob_grad[i];
+    stored_mu_grad_output[i] =
+        action_grad[i] * fast_tanh_derivative(stored_action[i]);
+    stored_logstd_grad_output[i] = logprob_grad[i];
 
     // Backpropagate to output weights
     for (int j = 0; j < HIDDEN2_SIZE; j++) {
@@ -294,11 +312,11 @@ void snn_backward_pass(const float *state, const float *action_grad,
       }
       avg_hidden2_activity /= TIME_STEPS;
 
-      mu_grad[i][j] += mu_grad_output * avg_hidden2_activity;
-      logstd_grad[i][j] += logstd_grad_output * avg_hidden2_activity;
+      mu_grad[i][j] += stored_mu_grad_output[i] * avg_hidden2_activity;
+      logstd_grad[i][j] += stored_logstd_grad_output[i] * avg_hidden2_activity;
     }
-    mu_bias_grad[i] += mu_grad_output;
-    logstd_bias_grad[i] += logstd_grad_output;
+    mu_bias_grad[i] += stored_mu_grad_output[i];
+    logstd_bias_grad[i] += stored_logstd_grad_output[i];
   }
 
   // Backpropagate to hidden layer 2
@@ -306,8 +324,8 @@ void snn_backward_pass(const float *state, const float *action_grad,
   for (int j = 0; j < HIDDEN2_SIZE; j++) {
     grad_hidden2[j] = 0.0f;
     for (int i = 0; i < NUM_ACTIONS; i++) {
-      grad_hidden2[j] += (mu_grad_output * mu_weights[i][j] +
-                          logstd_grad_output * logstd_weights[i][j]);
+      grad_hidden2[j] += (stored_mu_grad_output[i] * mu_weights[i][j] +
+                          stored_logstd_grad_output[i] * logstd_weights[i][j]);
     }
   }
 
