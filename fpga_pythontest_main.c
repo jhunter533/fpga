@@ -21,10 +21,10 @@ struct netif *app_netif;
 static struct netif server_netif;
 struct netif *echo_netif;
 
-static unsigned int simple_rand_state = 12345;
+static unsigned int simple_rand_state = 12345u;
 
 int simple_rand() {
-  simple_rand_state = simple_rand_state * 1103515245 + 12345;
+  simple_rand_state = simple_rand_state * 1103515245u + 12345u;
   return (unsigned int)(simple_rand_state / 65536) % 32768;
 }
 
@@ -45,7 +45,32 @@ void tcp_slowtmr(void);
 #define DT 1.0f            // Fixed point: 1.0
 
 // Training parameters
-#define LEARNING_RATE .001f // Fixed point: 0.3
+#define LEARNING_RATE .003f // Fixed point: 0.3
+
+// HEADER DEFINITION
+#pragma pack(push, 1)
+#define MSG_MAGIC 0xDEADBEEF
+
+typedef struct {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t msg_type;
+  uint32_t seq_no;
+  uint32_t payload_len;
+} msg_header_t;
+
+typedef enum {
+  MSG_TYPE_ACTOR_QUERY = 1,
+  MSG_TYPE_ACTOR_RESPONSE = 2,
+  MSG_TYPE_MINIBATCH_QUERY = 3,
+  MSG_TYPE_MINIBATCH_RESP = 4,
+  MSG_TYPE_GRAD_UPDATE = 5,
+  MSG_TYPE_ACK = 6,
+  MSG_TYPE_PING = 7,
+  MSG_TYPE_PONG = 8,
+} msg_type_t;
+
+#pragma pack(pop)
 
 // Network weights
 static float fc1_weights[HIDDEN1_SIZE][NUM_STATES];
@@ -82,7 +107,6 @@ typedef struct {
 typedef struct {
   float v_membrane;
   float tau_membrane;
-  float leak_rate;
 } li_neuron_t;
 
 static float hidden1_voltages[TIME_STEPS][HIDDEN1_SIZE];
@@ -98,6 +122,21 @@ static float stored_log_prob[NUM_ACTIONS];
 
 static float stored_mu_grad_output[NUM_ACTIONS];
 static float stored_logstd_grad_output[NUM_ACTIONS];
+
+typedef struct {
+  float state[NUM_STATES];
+  float action[NUM_ACTIONS];
+  float log_prob;
+  float hidden1_v[TIME_STEPS][HIDDEN1_SIZE];
+  float hidden2_v[TIME_STEPS][HIDDEN2_SIZE];
+  float hidden1_in[TIME_STEPS][HIDDEN1_SIZE];
+  float hidden2_in[TIME_STEPS][HIDDEN2_SIZE];
+} sample_trace_t;
+
+#define MAX_BATCH_SIZE 256
+static sample_trace_t batch_traces[MAX_BATCH_SIZE];
+static int batch_size = 0;
+static volatile uint32_t global_seq_no = 0;
 
 float fast_exp_neg(float x) {
   if (x > 10.0f)
@@ -141,13 +180,13 @@ float fast_tanh_derivative(float x) {
 
 // LIF neuron update
 int update_lif_neuron(lif_neuron_t *neuron, float input) {
-  float decay = .9512;
+  const float decay = .9512;
   neuron->voltage_trace = neuron->v_membrane * decay + input;
 
   if (neuron->voltage_trace >= neuron->v_threshold) {
     neuron->spike_trace = 1.0f;
-    neuron->v_membrane = 0.0f; // Reset
-    return 1;                  // Spike
+    neuron->v_membrane = V_RESET; // Reset
+    return 1;                     // Spike
   } else {
     neuron->spike_trace = 0.0f;
     neuron->v_membrane = neuron->voltage_trace;
@@ -164,24 +203,11 @@ float update_li_neuron(li_neuron_t *neuron, float input) {
 
 void matrix_multiply(const float *weights, const float *input, float *output,
                      int rows, int cols) {
-  // Use loop unrolling to reduce loop overhead
   for (int i = 0; i < rows; i++) {
     float sum = 0.0f;
-
-    // Process 4 elements at a time for better cache usage
-    int j = 0;
-    for (; j < cols - 3; j += 4) {
-      sum += weights[i * cols + j] * input[j] +
-             weights[i * cols + j + 1] * input[j + 1] +
-             weights[i * cols + j + 2] * input[j + 2] +
-             weights[i * cols + j + 3] * input[j + 3];
-    }
-
-    // Handle remaining elements
-    for (; j < cols; j++) {
+    for (int j = 0; j < cols; j++) {
       sum += weights[i * cols + j] * input[j];
     }
-
     output[i] = sum;
   }
 }
@@ -201,57 +227,51 @@ void snn_forward_pass(const float *state, float *action, float *log_prob) {
   // Initialize neurons
   for (int i = 0; i < HIDDEN1_SIZE; i++) {
     lif1_neurons[i].v_membrane = 0.0f;
-    lif1_neurons[i].voltage_trace = 0.0f;
-    lif1_neurons[i].spike_trace = 0.0f;
     lif1_neurons[i].v_threshold = V_THRESHOLD;
     lif1_neurons[i].tau_membrane = TAU_MEMBRANE;
+    lif1_neurons[i].spike_trace = 0.0f;
+    lif1_neurons[i].voltage_trace = 0.0f;
   }
   for (int i = 0; i < HIDDEN2_SIZE; i++) {
     lif2_neurons[i].v_membrane = 0.0f;
-    lif2_neurons[i].voltage_trace = 0.0f;
-    lif2_neurons[i].spike_trace = 0.0f;
     lif2_neurons[i].v_threshold = V_THRESHOLD;
     lif2_neurons[i].tau_membrane = TAU_MEMBRANE;
+    lif2_neurons[i].spike_trace = 0.0f;
+    lif2_neurons[i].voltage_trace = 0.0f;
   }
   for (int i = 0; i < NUM_ACTIONS; i++) {
     mu_neurons[i].v_membrane = 0.0f;
-    mu_neurons[i].tau_membrane = 20.0f;
-    mu_neurons[i].leak_rate = 0.1f;
+    mu_neurons[i].tau_membrane = TAU_MEMBRANE;
     logstd_neurons[i].v_membrane = 0.0f;
-    logstd_neurons[i].tau_membrane = 20.0f;
-    logstd_neurons[i].leak_rate = 0.1f;
+    logstd_neurons[i].tau_membrane = TAU_MEMBRANE;
   }
 
   // Time-stepped simulation
   for (int t = 0; t < TIME_STEPS; t++) {
-    // Layer 1: state -> hidden1
+    // Layer 1: state -> hidden1 (LIF)
     matrix_multiply((float *)fc1_weights, state, hidden1, HIDDEN1_SIZE,
                     NUM_STATES);
     for (int i = 0; i < HIDDEN1_SIZE; i++) {
       float input = hidden1[i] + fc1_bias[i];
       hidden1_inputs[t][i] = input;
       update_lif_neuron(&lif1_neurons[i], input);
-
-      // Store traces
       hidden1_voltages[t][i] = lif1_neurons[i].voltage_trace;
       hidden1_spikes[t][i] = lif1_neurons[i].spike_trace;
     }
 
-    // Layer 2: hidden1 -> hidden2
+    // Layer 2: hidden1 -> hidden2 (LIF)
     matrix_multiply((float *)fc2_weights, hidden1, hidden2, HIDDEN2_SIZE,
                     HIDDEN1_SIZE);
     for (int i = 0; i < HIDDEN2_SIZE; i++) {
       float input = hidden2[i] + fc2_bias[i];
       hidden2_inputs[t][i] = input;
       update_lif_neuron(&lif2_neurons[i], input);
-
-      // Store traces
       hidden2_voltages[t][i] = lif2_neurons[i].voltage_trace;
       hidden2_spikes[t][i] = lif2_neurons[i].spike_trace;
     }
   }
 
-  // Output layers: LI neurons for continuous output
+  // Output layers: LI neurons
   matrix_multiply((float *)mu_weights, hidden2, mu_output, NUM_ACTIONS,
                   HIDDEN2_SIZE);
   matrix_multiply((float *)logstd_weights, hidden2, logstd_output, NUM_ACTIONS,
@@ -263,127 +283,99 @@ void snn_forward_pass(const float *state, float *action, float *log_prob) {
         update_li_neuron(&logstd_neurons[i], logstd_output[i] + logstd_bias[i]);
 
     action[i] = fast_tanh(mu_val);
-    log_prob[i] =
-        logstd_val > 2.0f ? 2.0f : (logstd_val < -20.0f ? -20.0f : logstd_val);
+    log_prob[i] = (logstd_val > 2.0f)
+                      ? 2.0f
+                      : ((logstd_val < -20.0f) ? -20.0f : logstd_val);
   }
+
   for (int i = 0; i < NUM_ACTIONS; i++) {
     stored_action[i] = action[i];
     stored_log_prob[i] = log_prob[i];
   }
 }
 
-void snn_backward_pass(const float *state, const float *action_grad,
-                       const float *logprob_grad) {
-  // Initialize gradients to zero
-  for (int i = 0; i < HIDDEN1_SIZE; i++) {
-    for (int j = 0; j < NUM_STATES; j++) {
-      fc1_grad[i][j] = 0.0f;
-    }
-    fc1_bias_grad[i] = 0.0f;
-  }
-  for (int i = 0; i < HIDDEN2_SIZE; i++) {
-    for (int j = 0; j < HIDDEN1_SIZE; j++) {
-      fc2_grad[i][j] = 0.0f;
-    }
-    fc2_bias_grad[i] = 0.0f;
-  }
-  for (int i = 0; i < NUM_ACTIONS; i++) {
-    for (int j = 0; j < HIDDEN2_SIZE; j++) {
-      mu_grad[i][j] = 0.0f;
-      logstd_grad[i][j] = 0.0f;
-    }
-    mu_bias_grad[i] = 0.0f;
-    logstd_bias_grad[i] = 0.0f;
-  }
+void snn_backward_pass(const sample_trace_t *trace, const float *dL_da,
+                       const float *dL_dlogp) {
 
-  // Calculate gradients for output layer
+  // 1. Output layer gradients
   for (int i = 0; i < NUM_ACTIONS; i++) {
-    // Derivative of tanh for action
     stored_mu_grad_output[i] =
-        action_grad[i] * fast_tanh_derivative(stored_action[i]);
-    stored_logstd_grad_output[i] = logprob_grad[i];
-
-    // Backpropagate to output weights
-    for (int j = 0; j < HIDDEN2_SIZE; j++) {
-      // Average activity over time for gradient calculation
-      float avg_hidden2_activity = 0.0f;
-      for (int t = 0; t < TIME_STEPS; t++) {
-        avg_hidden2_activity += hidden2_voltages[t][j];
-      }
-      avg_hidden2_activity /= TIME_STEPS;
-
-      mu_grad[i][j] += stored_mu_grad_output[i] * avg_hidden2_activity;
-      logstd_grad[i][j] += stored_logstd_grad_output[i] * avg_hidden2_activity;
-    }
-    mu_bias_grad[i] += stored_mu_grad_output[i];
-    logstd_bias_grad[i] += stored_logstd_grad_output[i];
+        dL_da[i] * fast_tanh_derivative(trace->action[i]);
+    stored_logstd_grad_output[i] = dL_dlogp[i];
   }
 
-  // Backpropagate to hidden layer 2
-  float grad_hidden2[HIDDEN2_SIZE];
+  // 2. Backprop to hidden2
+  float grad_hidden2[HIDDEN2_SIZE] = {0};
   for (int j = 0; j < HIDDEN2_SIZE; j++) {
-    grad_hidden2[j] = 0.0f;
     for (int i = 0; i < NUM_ACTIONS; i++) {
       grad_hidden2[j] += (stored_mu_grad_output[i] * mu_weights[i][j] +
                           stored_logstd_grad_output[i] * logstd_weights[i][j]);
     }
   }
 
-  // Backpropagate through time for LIF neurons
+  // 3. Backprop through time (LIF2)
   for (int t = TIME_STEPS - 1; t >= 0; t--) {
     for (int i = 0; i < HIDDEN2_SIZE; i++) {
-      // Surrogate gradient for LIF neuron
-      float surrogate_grad =
-          surrogate_gradient(hidden2_voltages[t][i], V_THRESHOLD);
-      float total_grad = grad_hidden2[i] * surrogate_grad;
-
-      // Accumulate gradients for hidden2 weights
-      float input_activity = hidden2_inputs[t][i];
+      float sg = surrogate_gradient(trace->hidden2_v[t][i], V_THRESHOLD);
+      float total_grad = grad_hidden2[i] * sg;
       for (int j = 0; j < HIDDEN1_SIZE; j++) {
-        fc2_grad[i][j] += total_grad * hidden1_voltages[t][j];
+        fc2_grad[i][j] += total_grad * trace->hidden1_v[t][j];
       }
       fc2_bias_grad[i] += total_grad;
     }
   }
 
-  // Backpropagate to hidden layer 1
-  float grad_hidden1[HIDDEN1_SIZE];
+  // 4. Backprop to hidden1
+  float grad_hidden1[HIDDEN1_SIZE] = {0};
   for (int j = 0; j < HIDDEN1_SIZE; j++) {
-    grad_hidden1[j] = 0.0f;
     for (int i = 0; i < HIDDEN2_SIZE; i++) {
       grad_hidden1[j] += grad_hidden2[i] * fc2_weights[i][j];
     }
   }
 
-  // Backpropagate through time for first hidden layer
+  // 5. Backprop through time (LIF1)
   for (int t = TIME_STEPS - 1; t >= 0; t--) {
     for (int i = 0; i < HIDDEN1_SIZE; i++) {
-      // Surrogate gradient for LIF neuron
-      float surrogate_grad =
-          surrogate_gradient(hidden1_voltages[t][i], V_THRESHOLD);
-      float total_grad = grad_hidden1[i] * surrogate_grad;
-
-      // Accumulate gradients for hidden1 weights
+      float sg = surrogate_gradient(trace->hidden1_v[t][i], V_THRESHOLD);
+      float total_grad = grad_hidden1[i] * sg;
       for (int j = 0; j < NUM_STATES; j++) {
-        fc1_grad[i][j] += total_grad * state[j];
+        fc1_grad[i][j] += total_grad * trace->state[j];
       }
       fc1_bias_grad[i] += total_grad;
     }
   }
 
-  // Update weights using accumulated gradients
+  // 6. Output weights (use last time step)
+  for (int i = 0; i < NUM_ACTIONS; i++) {
+    for (int j = 0; j < HIDDEN2_SIZE; j++) {
+      mu_grad[i][j] +=
+          stored_mu_grad_output[i] * trace->hidden2_v[TIME_STEPS - 1][j];
+      logstd_grad[i][j] +=
+          stored_logstd_grad_output[i] * trace->hidden2_v[TIME_STEPS - 1][j];
+    }
+    mu_bias_grad[i] += stored_mu_grad_output[i];
+    logstd_bias_grad[i] += stored_logstd_grad_output[i];
+  }
+}
+
+void apply_gradients() {
+  unsigned int old_state = Xil_ExceptionGetStatus();
+  Xil_ExceptionDisable();
+
   for (int i = 0; i < HIDDEN1_SIZE; i++) {
     for (int j = 0; j < NUM_STATES; j++) {
       fc1_weights[i][j] -= LEARNING_RATE * fc1_grad[i][j];
     }
     fc1_bias[i] -= LEARNING_RATE * fc1_bias_grad[i];
   }
+
   for (int i = 0; i < HIDDEN2_SIZE; i++) {
     for (int j = 0; j < HIDDEN1_SIZE; j++) {
       fc2_weights[i][j] -= LEARNING_RATE * fc2_grad[i][j];
     }
     fc2_bias[i] -= LEARNING_RATE * fc2_bias_grad[i];
   }
+
   for (int i = 0; i < NUM_ACTIONS; i++) {
     for (int j = 0; j < HIDDEN2_SIZE; j++) {
       mu_weights[i][j] -= LEARNING_RATE * mu_grad[i][j];
@@ -392,6 +384,18 @@ void snn_backward_pass(const float *state, const float *action_grad,
     mu_bias[i] -= LEARNING_RATE * mu_bias_grad[i];
     logstd_bias[i] -= LEARNING_RATE * logstd_bias_grad[i];
   }
+
+  // Zero gradients
+  memset(fc1_grad, 0, sizeof(fc1_grad));
+  memset(fc2_grad, 0, sizeof(fc2_grad));
+  memset(mu_grad, 0, sizeof(mu_grad));
+  memset(logstd_grad, 0, sizeof(logstd_grad));
+  memset(fc1_bias_grad, 0, sizeof(fc1_bias_grad));
+  memset(fc2_bias_grad, 0, sizeof(fc2_bias_grad));
+  memset(mu_bias_grad, 0, sizeof(mu_bias_grad));
+  memset(logstd_bias_grad, 0, sizeof(logstd_bias_grad));
+
+  Xil_ExceptionRestore(old_state);
 }
 
 // Initialize weights with proper distribution
@@ -423,6 +427,139 @@ void initialize_weights() {
   }
 }
 
+err_t send_response(struct tcp_pcb *tpcb, uint16_t msg_type,
+                    const void *payload, uint32_t len) {
+  msg_header_t hdr = {.magic = MSG_MAGIC,
+                      .version = 1,
+                      .msg_type = msg_type,
+                      .seq_no = ++global_seq_no,
+                      .payload_len = len};
+
+  uint32_t total_len = sizeof(hdr) + len;
+  char *buf = mem_malloc(total_len);
+  if (!buf)
+    return ERR_MEM;
+
+  memcpy(buf, &hdr, sizeof(hdr));
+  if (len)
+    memcpy(buf + sizeof(hdr), payload, len);
+
+  err_t err = tcp_write(tpcb, buf, total_len, TCP_WRITE_FLAG_COPY);
+  mem_free(buf);
+  if (err == ERR_OK)
+    tcp_output(tpcb);
+  return err;
+}
+
+// ===== MESSAGE HANDLERS =====
+err_t handle_actor_query(struct tcp_pcb *tpcb, const float *state, int done) {
+  float action[NUM_ACTIONS];
+  float log_prob;
+  sample_trace_t trace;
+
+  memcpy(trace.state, state, sizeof(trace.state));
+  snn_forward_pass(state, action, &log_prob);
+
+  // Save traces (using YOUR global arrays)
+  for (int t = 0; t < TIME_STEPS; t++) {
+    memcpy(trace.hidden1_v[t], hidden1_voltages[t],
+           sizeof(hidden1_voltages[t]));
+    memcpy(trace.hidden2_v[t], hidden2_voltages[t],
+           sizeof(hidden2_voltages[t]));
+    memcpy(trace.hidden1_in[t], hidden1_inputs[t], sizeof(hidden1_inputs[t]));
+    memcpy(trace.hidden2_in[t], hidden2_inputs[t], sizeof(hidden2_inputs[t]));
+  }
+  memcpy(trace.action, action, sizeof(action));
+  trace.log_prob = log_prob;
+
+  batch_traces[0] = trace;
+  batch_size = 1;
+
+  char response[sizeof(float) * (NUM_ACTIONS + 1)];
+  memcpy(response, action, sizeof(float) * NUM_ACTIONS);
+  memcpy(response + sizeof(float) * NUM_ACTIONS, &log_prob, sizeof(float));
+
+  return send_response(tpcb, MSG_TYPE_ACTOR_RESPONSE, response,
+                       sizeof(response));
+}
+
+err_t handle_minibatch_query(struct tcp_pcb *tpcb, const uint8_t *payload,
+                             uint32_t len) {
+  if (len < 4)
+    return ERR_ARG;
+  uint32_t N = *(uint32_t *)payload;
+  if (N == 0 || N > MAX_BATCH_SIZE)
+    return ERR_ARG;
+
+  uint32_t states_bytes = N * NUM_STATES * sizeof(float);
+  if (4 + states_bytes != len)
+    return ERR_ARG;
+
+  const float *states = (const float *)(payload + 4);
+  batch_size = N;
+
+  uint32_t resp_size = 4 + N * (NUM_ACTIONS + 1) * sizeof(float);
+  char *resp = mem_malloc(resp_size);
+  if (!resp)
+    return ERR_MEM;
+
+  *(uint32_t *)resp = N;
+  float *out = (float *)(resp + 4);
+
+  for (uint32_t i = 0; i < N; i++) {
+    const float *s = &states[i * NUM_STATES];
+    sample_trace_t *trace = &batch_traces[i];
+
+    memcpy(trace->state, s, sizeof(trace->state));
+    snn_forward_pass(s, trace->action, &trace->log_prob);
+
+    // Save traces
+    for (int t = 0; t < TIME_STEPS; t++) {
+      memcpy(trace->hidden1_v[t], hidden1_voltages[t],
+             sizeof(hidden1_voltages[t]));
+      memcpy(trace->hidden2_v[t], hidden2_voltages[t],
+             sizeof(hidden2_voltages[t]));
+      memcpy(trace->hidden1_in[t], hidden1_inputs[t],
+             sizeof(hidden1_inputs[t]));
+      memcpy(trace->hidden2_in[t], hidden2_inputs[t],
+             sizeof(hidden2_inputs[t]));
+    }
+
+    memcpy(out, trace->action, sizeof(float) * NUM_ACTIONS);
+    out[NUM_ACTIONS] = trace->log_prob;
+    out += (NUM_ACTIONS + 1);
+  }
+
+  err_t err = send_response(tpcb, MSG_TYPE_MINIBATCH_RESP, resp, resp_size);
+  mem_free(resp);
+  return err;
+}
+
+err_t handle_grad_update(struct tcp_pcb *tpcb, const uint8_t *payload,
+                         uint32_t len) {
+  if (len < 4)
+    return ERR_ARG;
+  uint32_t N = *(uint32_t *)payload;
+  if (N == 0 || N > MAX_BATCH_SIZE || N > batch_size)
+    return ERR_ARG;
+
+  uint32_t grad_bytes =
+      N * (NUM_ACTIONS * 2) * sizeof(float); // dL/da + dL/dlogp
+  if (4 + grad_bytes != len)
+    return ERR_ARG;
+
+  const float *grads = (const float *)(payload + 4);
+
+  for (uint32_t i = 0; i < N; i++) {
+    const float *dL_da = &grads[i * 2 * NUM_ACTIONS];
+    const float *dL_dlogp = &grads[i * 2 * NUM_ACTIONS + NUM_ACTIONS];
+    snn_backward_pass(&batch_traces[i], dL_da, dL_dlogp);
+  }
+
+  apply_gradients();
+  return send_response(tpcb, MSG_TYPE_ACK, NULL, 0);
+}
+
 // TCP data handling
 err_t tcp_data_received(void *arg, struct tcp_pcb *tpcb, struct pbuf *p,
                         err_t err) {
@@ -434,37 +571,44 @@ err_t tcp_data_received(void *arg, struct tcp_pcb *tpcb, struct pbuf *p,
     return ERR_OK;
   }
 
-  // Parse incoming data (state from PC)
-  if (p->tot_len >= sizeof(float) * (NUM_STATES + 1)) { // state + done flag
-    float *data = (float *)p->payload;
-    float state[NUM_STATES];
-    int done = (int)data[NUM_STATES];
+  if (p->tot_len >= sizeof(msg_header_t)) {
+    msg_header_t hdr;
+    memcpy(&hdr, p->payload, sizeof(hdr));
 
-    for (int i = 0; i < NUM_STATES; i++) {
-      state[i] = data[i];
-    }
-
-    // Forward pass through SNN
-    float action[NUM_ACTIONS];
-    float log_prob[NUM_ACTIONS];
-
-    snn_forward_pass(state, action, log_prob);
-
-    // Send action and log_prob back to PC
-    char response[sizeof(float) * (NUM_ACTIONS + 1)];
-    memcpy(response, action, sizeof(float) * NUM_ACTIONS);
-    memcpy(response + sizeof(float) * NUM_ACTIONS, log_prob, sizeof(float));
-
-    err_t write_err =
-        tcp_write(tpcb, response, sizeof(response), TCP_WRITE_FLAG_COPY);
-    if (write_err == ERR_OK) {
-      tcp_output(tpcb);
+    if (hdr.magic == MSG_MAGIC && hdr.version == 1) {
+      uint32_t total = sizeof(hdr) + hdr.payload_len;
+      if (p->tot_len >= total) {
+        const uint8_t *payload = (const uint8_t *)p->payload + sizeof(hdr);
+        switch (hdr.msg_type) {
+        case MSG_TYPE_ACTOR_QUERY:
+          if (hdr.payload_len == (NUM_STATES + 1) * sizeof(float)) {
+            float state[NUM_STATES];
+            int done =
+                (*(float *)(payload + NUM_STATES * sizeof(float)) > 0.5f);
+            memcpy(state, payload, sizeof(state));
+            handle_actor_query(tpcb, state, done);
+          }
+          break;
+        case MSG_TYPE_MINIBATCH_QUERY:
+          handle_minibatch_query(tpcb, payload, hdr.payload_len);
+          break;
+        case MSG_TYPE_GRAD_UPDATE:
+          handle_grad_update(tpcb, payload, hdr.payload_len);
+          break;
+        case MSG_TYPE_PING:
+          send_response(tpcb, MSG_TYPE_PONG, NULL, 0);
+          break;
+        default:
+          xil_printf("Unknown msg type: %d\r\n", hdr.msg_type);
+        }
+      }
+    } else {
+      xil_printf("Bad magic/version: 0x%08X v%d\r\n", hdr.magic, hdr.version);
     }
   }
 
   tcp_recved(tpcb, p->tot_len);
   pbuf_free(p);
-
   return ERR_OK;
 }
 
@@ -482,29 +626,22 @@ err_t tcp_connection_accepted(void *arg, struct tcp_pcb *newpcb, err_t err) {
 }
 
 int init_tcp_server() {
-  struct tcp_pcb *pcb;
-
-  pcb = tcp_new();
-  if (pcb == NULL) {
-    xil_printf("Error: could not create PCB\r\n");
+  struct tcp_pcb *pcb = tcp_new();
+  if (pcb == NULL)
     return -1;
-  }
 
   err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_PORT);
   if (err != ERR_OK) {
-    xil_printf("Error: could not bind to port %d\r\n", TCP_PORT);
     tcp_close(pcb);
     return -1;
   }
 
   pcb = tcp_listen(pcb);
-  if (pcb == NULL) {
-    xil_printf("Error: could not listen\r\n");
+  if (pcb == NULL)
     return -1;
-  }
 
   tcp_accept(pcb, tcp_connection_accepted);
-  xil_printf("SNN Actor TCP server listening on port %d\r\n", TCP_PORT);
+  xil_printf("TCP server listening on port %d\r\n", TCP_PORT);
   return 0;
 }
 

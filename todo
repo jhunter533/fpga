@@ -1,0 +1,22 @@
+Actually do good networking
+Actor IO: thread 1 half duplex 
+queues state,done-> gets action,log_prob
+Trainer: thread 2 runs train_step on mini-batches using queue and deque
+
+by separating IO from rest we dont stall while waiting
+
+Have to lock weights for stability to keep the two halves synched between normal call and minibatch
+
+TCP Protocol:
+
+Python Concurrency:
+
+FPGA Robustness:
+
+Weight Consistency:
+
+Error Recovery:
+
+Testing:
+
+
