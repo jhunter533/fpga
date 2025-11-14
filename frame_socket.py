@@ -68,6 +68,18 @@ class FramedSocket:
                 self.sock.close()
                 self.sock = None
                 raise ConnectionError(f"Receive failed: {e}")
+    def ping(self) -> bool:
+        """Send PING, expect PONG. Returns True on success."""
+        self.seq += 1
+        msg = Message.ping(self.seq)
+        self.send_msg(msg)
+        resp = self.recv_msg()
+        try:
+            resp.expect_pong()
+            return True
+        except ValueError as e:
+            print(f"PING failed: {e}")
+            return False
     def query_actor(self, state, done) -> Tuple[List[float], float]:
         self.seq += 1
         msg = Message.actor_query(self.seq, state, done)
@@ -85,3 +97,9 @@ class FramedSocket:
         if resp.msg_type != Message.TYPE_MINIBATCH_RESP:
             raise ValueError(f"Expected minibatch response, got {resp.msg_type}")
         return resp.parse_minibatch_response(num_actions=1)
+    def send_grad_update(self, dL_da: List[List[float]], dL_dlogp: List[float]) -> None:
+        self.seq += 1
+        msg = Message.grad_update(self.seq, dL_da, dL_dlogp)
+        self.send_msg(msg)
+        resp = self.recv_msg()
+        resp.expect_ack()  # raises if not ACK

@@ -6,10 +6,12 @@
 #include "platform.h"
 #include "platform_config.h"
 #include "xil_cache.h"
+#include "xil_exception.h"
 #include "xil_printf.h"
 #include "xparameters.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -135,22 +137,21 @@ typedef struct {
 
 #define MAX_BATCH_SIZE 256
 static sample_trace_t batch_traces[MAX_BATCH_SIZE];
-static int batch_size = 0;
+static uint32_t batch_size = 0;
 static volatile uint32_t global_seq_no = 0;
 
 float fast_exp_neg(float x) {
-  if (x > 10.0f)
-    return 0.000045f; // e^(-10)
+  // Compute e^x, but x is expected to be ≤ 0 (from -|Δv|)
   if (x < -10.0f)
-    return 22026.47f; // e^10
-  // Taylor series: e^x = 1 + x + x^2/2! + x^3/3! + ...
-  float result = 1.0f;
-  float term = 1.0f;
+    return 4.54e-5f; // e^(-10)
+  if (x > 0.0f)
+    return 1.0f; // clamp positive to 1.0 (shouldn't happen)
+  float result = 1.0f, term = 1.0f;
   for (int i = 1; i <= 8; i++) {
     term *= x / i;
     result += term;
   }
-  return result;
+  return result < 0.0f ? 0.0f : (result > 1.0f ? 1.0f : result);
 }
 
 // Fast absolute value
@@ -159,8 +160,12 @@ float fast_fabs(float x) { return x > 0 ? x : -x; }
 // Surrogate gradient function
 float surrogate_gradient(float membrane_voltage, float threshold) {
   float x = membrane_voltage - threshold;
-  float k = 0.5f; // Steepness parameter
-  return k * fast_exp_neg(-fast_fabs(x));
+  float ax = fast_fabs(x);
+  // Clamp input to safe range: exp(-|x|) max = 1 (at x=0)
+  if (ax > 8.0f)
+    return 0.0f;                     // e^(-8) ≈ 0.0003 — negligible
+  float exp_val = fast_exp_neg(-ax); // now -ax ∈ [-8, 0] → exp ∈ [0.0003, 1]
+  return 0.5f * exp_val;
 }
 
 // Fast tanh approximation
@@ -359,8 +364,6 @@ void snn_backward_pass(const sample_trace_t *trace, const float *dL_da,
 }
 
 void apply_gradients() {
-  unsigned int old_state = Xil_ExceptionGetStatus();
-  Xil_ExceptionDisable();
 
   for (int i = 0; i < HIDDEN1_SIZE; i++) {
     for (int j = 0; j < NUM_STATES; j++) {
@@ -394,8 +397,6 @@ void apply_gradients() {
   memset(fc2_bias_grad, 0, sizeof(fc2_bias_grad));
   memset(mu_bias_grad, 0, sizeof(mu_bias_grad));
   memset(logstd_bias_grad, 0, sizeof(logstd_bias_grad));
-
-  Xil_ExceptionRestore(old_state);
 }
 
 // Initialize weights with proper distribution
@@ -436,19 +437,27 @@ err_t send_response(struct tcp_pcb *tpcb, uint16_t msg_type,
                       .payload_len = len};
 
   uint32_t total_len = sizeof(hdr) + len;
-  char *buf = mem_malloc(total_len);
-  if (!buf)
-    return ERR_MEM;
-
-  memcpy(buf, &hdr, sizeof(hdr));
-  if (len)
-    memcpy(buf + sizeof(hdr), payload, len);
-
-  err_t err = tcp_write(tpcb, buf, total_len, TCP_WRITE_FLAG_COPY);
-  mem_free(buf);
-  if (err == ERR_OK)
-    tcp_output(tpcb);
-  return err;
+  if (total_len <= 256) {
+    // Use stack buffer — safe and fast
+    char buf[256];
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len)
+      memcpy(buf + sizeof(hdr), payload, len);
+    return tcp_write(tpcb, buf, total_len, TCP_WRITE_FLAG_COPY);
+  } else {
+    // Large response (e.g., minibatch) — use heap
+    char *buf = mem_malloc(total_len);
+    if (!buf) {
+      xil_printf("send_response: malloc(%u) failed\n", total_len);
+      return ERR_MEM;
+    }
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len)
+      memcpy(buf + sizeof(hdr), payload, len);
+    err_t err = tcp_write(tpcb, buf, total_len, TCP_WRITE_FLAG_COPY);
+    mem_free(buf);
+    return err;
+  }
 }
 
 // ===== MESSAGE HANDLERS =====
@@ -537,27 +546,21 @@ err_t handle_minibatch_query(struct tcp_pcb *tpcb, const uint8_t *payload,
 
 err_t handle_grad_update(struct tcp_pcb *tpcb, const uint8_t *payload,
                          uint32_t len) {
-  if (len < 4)
-    return ERR_ARG;
-  uint32_t N = *(uint32_t *)payload;
-  if (N == 0 || N > MAX_BATCH_SIZE || N > batch_size)
-    return ERR_ARG;
-
-  uint32_t grad_bytes =
-      N * (NUM_ACTIONS * 2) * sizeof(float); // dL/da + dL/dlogp
-  if (4 + grad_bytes != len)
-    return ERR_ARG;
-
-  const float *grads = (const float *)(payload + 4);
-
-  for (uint32_t i = 0; i < N; i++) {
-    const float *dL_da = &grads[i * 2 * NUM_ACTIONS];
-    const float *dL_dlogp = &grads[i * 2 * NUM_ACTIONS + NUM_ACTIONS];
-    snn_backward_pass(&batch_traces[i], dL_da, dL_dlogp);
+  // Parse N safely (just for debug)
+  uint32_t N = 0;
+  if (len >= 4) {
+    N = *(uint32_t *)payload;
   }
+  xil_printf("Rx GRAD_UPDATE (N=%u, len=%u)\r\n", N, len);
 
-  apply_gradients();
-  return send_response(tpcb, MSG_TYPE_ACK, NULL, 0);
+  // Send ACK immediately — no backward, no apply_gradients
+  err_t err = send_response(tpcb, MSG_TYPE_ACK, NULL, 0);
+  if (err != ERR_OK) {
+    xil_printf("ACK send failed: %d\r\n", err);
+  } else {
+    xil_printf("ACK sent\r\n");
+  }
+  return err;
 }
 
 // TCP data handling
@@ -571,14 +574,45 @@ err_t tcp_data_received(void *arg, struct tcp_pcb *tpcb, struct pbuf *p,
     return ERR_OK;
   }
 
-  if (p->tot_len >= sizeof(msg_header_t)) {
+  uint32_t total_received = p->tot_len;
+
+  // Accumulate data if needed (for simplicity, assume messages fit in one pbuf
+  // for now) But safer: always use pbuf_copy_partial
+
+  if (total_received >= sizeof(msg_header_t)) {
     msg_header_t hdr;
-    memcpy(&hdr, p->payload, sizeof(hdr));
+    // Safely copy header from pbuf chain
+    if (pbuf_copy_partial(p, &hdr, sizeof(hdr), 0) != sizeof(hdr)) {
+      xil_printf("Header copy failed\r\n");
+      tcp_recved(tpcb, p->tot_len);
+      pbuf_free(p);
+      return ERR_OK;
+    }
 
     if (hdr.magic == MSG_MAGIC && hdr.version == 1) {
-      uint32_t total = sizeof(hdr) + hdr.payload_len;
-      if (p->tot_len >= total) {
-        const uint8_t *payload = (const uint8_t *)p->payload + sizeof(hdr);
+      uint32_t total_msg_len = sizeof(hdr) + hdr.payload_len;
+      if (total_received >= total_msg_len) {
+        uint8_t *payload = NULL;
+        if (hdr.payload_len > 0) {
+          xil_printf("Rx: type=%d, len=%u\r\n", hdr.msg_type, hdr.payload_len);
+          payload = (uint8_t *)mem_malloc(hdr.payload_len);
+          if (!payload) {
+            xil_printf("malloc(%u) failed\n", hdr.payload_len);
+            tcp_recved(tpcb, p->tot_len);
+            pbuf_free(p);
+            return ERR_OK;
+          }
+          if (pbuf_copy_partial(p, payload, hdr.payload_len, sizeof(hdr)) !=
+              hdr.payload_len) {
+            xil_printf("copy failed\n");
+            mem_free(payload);
+            tcp_recved(tpcb, p->tot_len);
+            pbuf_free(p);
+            return ERR_OK;
+          }
+        }
+
+        // Handle message
         switch (hdr.msg_type) {
         case MSG_TYPE_ACTOR_QUERY:
           if (hdr.payload_len == (NUM_STATES + 1) * sizeof(float)) {
@@ -601,7 +635,14 @@ err_t tcp_data_received(void *arg, struct tcp_pcb *tpcb, struct pbuf *p,
         default:
           xil_printf("Unknown msg type: %d\r\n", hdr.msg_type);
         }
+
+        if (payload)
+          mem_free(payload); // safe: NULL ignored by mem_free
+      } else {
+        xil_printf("Incomplete: need %u, got %u\r\n", total_msg_len,
+                   total_received);
       }
+
     } else {
       xil_printf("Bad magic/version: 0x%08X v%d\r\n", hdr.magic, hdr.version);
     }

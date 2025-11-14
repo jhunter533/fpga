@@ -71,13 +71,18 @@ class Trainer:
 
         print(f"Training listening on {host}:{port}")
 
+        if not self.socket.ping():
+            raise RuntimeError("FPGA ping failed")
+        print("PING successful")
+
         self.env=gym.make('Pendulum-v1',render_mode='human')
         self.num_states=3
         self.env.metadata['render_fps']=0
         self.num_actions=1
         self.action_bound=self.env.action_space.high
 
-        self.transition_queue=queue.Queue(maxsize=10000)
+
+        self.transition_queue=queue.Queue(maxsize=50000)
         self.stop_event=threading.Event()
 
         self.critic1=Critic(self.num_states,self.num_actions)
@@ -89,7 +94,7 @@ class Trainer:
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
 
-        self.replay_buffer=ReplayBuffer(num_actions=self.num_actions,num_states=self.num_states)
+        self.replay_buffer=ReplayBuffer(num_actions=self.num_actions,num_states=self.num_states,batch_size=32)
         
         self.gamma=0.975
         self.tau=0.005
@@ -106,7 +111,7 @@ class Trainer:
                 next_state,reward,term,trunc,_=self.env.step(action)
                 done=term or trunc
                 total_reward=reward*5
-
+                print(f"[Actor] Step reward={reward}, done={done}")
                 self.transition_queue.put((
                     state.copy(),          # current state
                     np.array(action),      # action
@@ -118,6 +123,13 @@ class Trainer:
                 state=next_state
                 episode_reward+=total_reward
                 episode_step+=1
+                if done:
+                    print(f"Episode {episode_count:3d} | Steps: {episode_step:3d} | Reward: {episode_reward:8.2f}")
+                    # Reset for next episode
+                    state, _ = self.env.reset()
+                    episode_reward = 0.0
+                    episode_step = 0
+                    episode_count += 1
             except Exception as e:
                 print(f"[Actor] Error: {e}")
                 time.sleep(1)
@@ -153,34 +165,39 @@ class Trainer:
             # Rest of train_step (same as before)
             rewards = rewards.unsqueeze(1)
             dones = dones.unsqueeze(1)
+            
+            self.critic_optimizer1.zero_grad()
+            self.critic_optimizer2.zero_grad()
 
-            q1 = self.critic1(states, actions)
-            q2 = self.critic2(states, actions)
+            actions_det=actions.detach().requires_grad_(True)
+
+            q1 = self.critic1(states, actions_det)
+            q2 = self.critic2(states, actions_det)
             q_min=torch.min(q1,q2)
+            
+            q_min_sum=q_min.sum()
+            q_min_sum.backward()
+            dQ_da=actions_det.grad.clone().detach()
+
             with torch.no_grad():
                 q1_next = self.target_critic1(next_states, next_actions_tensor)
                 q2_next = self.target_critic2(next_states, next_actions_tensor)
                 q_next = torch.min(q1_next, q2_next)
                 targets = rewards + (1 - dones) * self.gamma * (q_next - self.alpha * next_log_probs_tensor)
+            q1=self.critic1(states,actions)
+            q2=self.critic2(states,actions)
 
             q1_loss = F.mse_loss(q1, targets)
             q2_loss = F.mse_loss(q2, targets)
 
-            self.critic_optimizer1.zero_grad()
             q1_loss.backward()
             self.critic_optimizer1.step()
 
-            self.critic_optimizer2.zero_grad()
             q2_loss.backward()
             self.critic_optimizer2.step()
         
-            actions.requires_grad_(True)
-            q_min.sum().backward()
-            dQ_da=actions.grad.clone()
-            actions.grad.zero()
-        
-            dL_da = -dQ_da.detach().cpu().numpy().astype(np.float32)  # [B, A]
-            dL_dlogp = np.full((self.replay_buffer.batch_size,), self.alpha, dtype=np.float32)  # [B]
+            dL_da = -dQ_da.cpu().numpy().astype(np.float32)
+            dL_dlogp = np.full((self.replay_buffer.batch_size,), self.alpha, dtype=np.float32)
 
             # === STEP 4: Send gradients to FPGA ===
             try:
@@ -207,29 +224,41 @@ class Trainer:
             self.stop_event.set()
             actor_t.join(timeout=2)
             trainer_t.join(timeout=2)
-    def send_grad_update(self,dL_da:np.ndarray,dL_dlogp:np.ndarray):
-        B, A = dL_da.shape
-        assert A == self.num_actions
-        assert len(dL_dlogp) == B
+    def send_grad_update(self, dL_da: np.ndarray, dL_dlogp: np.ndarray):
+        # Convert to list of lists (Python-native)
+        dL_da_list = dL_da.tolist()                 # [[a1], [a2], ..., [aN]]
+        dL_dlogp_list = dL_dlogp.tolist()           # [s1, s2, ..., sN]
+        self.socket.send_grad_update(dL_da_list, dL_dlogp_list)
+    def evaluate(self, episodes=5):
+        print(f"\n{'='*50}")
+        print(f"Evaluation over {episodes} episodes")
+        print(f"{'='*50}")
 
-        # Build payload: [N, (dL_da[0], dL_dlogp[0]), ..., (dL_da[N-1], dL_dlogp[N-1])]
-        payload = bytearray()
-        payload.extend(struct.pack("<I", B))  # N
+        total_rewards = []
+      
+        for ep in range(episodes):
+            state, _ = self.env.reset()
+            ep_reward = 0.0
+            step = 0
+            while True:
+                    # Query actor — no done flag needed for eval (but pass False)
+                action, _ = self.socket.query_actor(state.tolist(), done=False)
+                state, reward, terminated, truncated, _ = self.env.step(action)
+                ep_reward += reward
+                step += 1
 
-        for i in range(B):
-            # dL/da (NUM_ACTIONS floats)
-            payload.extend(dL_da[i].tobytes())
-            # dL/dlogp (1 float)
-            payload.extend(struct.pack("<f", dL_dlogp[i]))
+                   
+                if terminated or truncated:
+                    break
 
-        msg = Message(Message.TYPE_GRAD_UPDATE, self.socket.seq, bytes(payload))
-        self.socket.send_msg(msg)
+            total_rewards.append(ep_reward)
+            print(f"Eval Episode {ep+1}/{episodes} | Reward: {ep_reward:8.2f} | Steps: {step}")
 
-        # Wait for ACK
-        resp = self.socket.recv_msg()
-        if resp.msg_type != Message.TYPE_ACK:
-            raise RuntimeError(f"Expected ACK, got {resp.msg_type}")
-
+               
+        avg_reward = np.mean(total_rewards)
+        std_reward = np.std(total_rewards)
+        print(f"\nEvaluation Result: {avg_reward:.2f} ± {std_reward:.2f} (mean ± std)")
+        return avg_reward, std_reward
     def soft_update(self):
         for target_param, param in zip(self.target_critic1.parameters(), self.critic1.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -239,4 +268,5 @@ class Trainer:
 if __name__=="__main__":
     trainer=Trainer()
     trainer.run()
+    trainer.evaluate(episodes=10)
 
