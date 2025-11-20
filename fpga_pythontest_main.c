@@ -47,7 +47,7 @@ void tcp_slowtmr(void);
 #define DT 1.0f            // Fixed point: 1.0
 
 // Training parameters
-#define LEARNING_RATE .003f // Fixed point: 0.3
+#define LEARNING_RATE .0003f // Fixed point: 0.3
 
 // HEADER DEFINITION
 #pragma pack(push, 1)
@@ -152,6 +152,71 @@ float fast_exp_neg(float x) {
     result += term;
   }
   return result < 0.0f ? 0.0f : (result > 1.0f ? 1.0f : result);
+}
+
+float fast_exp(float x) {
+  // Clamp for safety
+  if (x < -10.0f)
+    return 4.54e-5f; // e^-10
+  if (x > 2.0f)
+    return 7.389f; // e^2
+
+  // Use exp(x) = 1 / exp(-x) for x < 0
+  if (x < 0.0f) {
+    return 1.0f / fast_exp_neg(-x);
+  }
+
+  // x ∈ [0, 2]: use 4th-order Taylor
+  float x2 = x * x;
+  float x3 = x2 * x;
+  float x4 = x3 * x;
+  return 1.0f + x + 0.5f * x2 + (1.0f / 6.0f) * x3 + (1.0f / 24.0f) * x4;
+}
+
+float fast_log1p(float x) {
+  // Clamp extreme values
+  if (x <= -1.0f)
+    return -20.0f; // log(0) → -inf
+  if (x >= 0.0f)
+    return 0.0f; // not used, but safe
+
+  // For x ∈ [−0.999, 0): use Taylor: x - x²/2 + x³/3 - x⁴/4
+  if (x < -0.999f)
+    return -6.907f; // log(0.001)
+  if (x > -1e-4f)
+    return x; // near 0: log1p(x) ≈ x
+
+  float x2 = x * x;
+  float x3 = x2 * x;
+  float x4 = x3 * x;
+  return x - 0.5f * x2 + (1.0f / 3.0f) * x3 - 0.25f * x4;
+}
+
+float fast_log(float x) {
+  if (x <= 0.0f)
+    return -20.0f;
+  if (x < 1e-4f)
+    return -9.21f; // log(1e-4)
+  if (x > 100.0f)
+    return 4.605f; // log(100)
+
+  // Normalize: x = m * 2^e, m ∈ [1,2)
+  int e = 0;
+  while (x >= 2.0f) {
+    x *= 0.5f;
+    e++;
+  }
+  while (x < 1.0f) {
+    x *= 2.0f;
+    e--;
+  }
+
+  // Use Pade approx for log(m), m ∈ [1,2):
+  // log(m) ≈ 2 * (m-1)/(m+1) * (1 + c1*(m-1)²) / (1 + c2*(m-1)²)
+  // Simpler: log(m) ≈ (m-1) * (1.0f - 0.5f*(m-1) + 0.333f*(m-1)*(m-1))
+  float t = x - 1.0f;
+  float t2 = t * t;
+  return (t - 0.5f * t2 + 0.333333f * t * t2) + (float)e * 0.693147f; // ln(2)
 }
 
 // Fast absolute value
@@ -287,29 +352,43 @@ void snn_forward_pass(const float *state, float *action, float *log_prob) {
     float logstd_val =
         update_li_neuron(&logstd_neurons[i], logstd_output[i] + logstd_bias[i]);
 
-    action[i] = fast_tanh(mu_val);
-    log_prob[i] = (logstd_val > 2.0f)
-                      ? 2.0f
-                      : ((logstd_val < -20.0f) ? -20.0f : logstd_val);
-  }
+    // Compute corrected log_pi = -logσ - log(1 - tanh²(u)) + 2*log(2)
+    float u = mu_val;
+    float tanh_u = fast_tanh(u);
+    float tanh2 = tanh_u * tanh_u;
+    float log_sigma = logstd_val;
+    float correction =
+        -fast_log1p(-tanh2) + 1.386294361f; // 2*ln(2) = ln(4) ≈ 1.38629
+    float log_pi = -log_sigma + correction;
 
-  for (int i = 0; i < NUM_ACTIONS; i++) {
+    // Clamp for stability
+    log_pi = (log_pi > 2.0f) ? 2.0f : ((log_pi < -20.0f) ? -20.0f : log_pi);
+
+    action[i] = tanh_u;
+    log_prob[i] = log_pi;
+
+    // Save for backward
     stored_action[i] = action[i];
-    stored_log_prob[i] = log_prob[i];
+    stored_log_prob[i] = log_pi;
   }
 }
 
 void snn_backward_pass(const sample_trace_t *trace, const float *dL_da,
                        const float *dL_dlogp) {
 
-  // 1. Output layer gradients
   for (int i = 0; i < NUM_ACTIONS; i++) {
-    stored_mu_grad_output[i] =
-        dL_da[i] * fast_tanh_derivative(trace->action[i]);
-    stored_logstd_grad_output[i] = dL_dlogp[i];
+    float a = trace->action[i];      // a = tanh(u), u ≈ μ
+    float tanh_deriv = 1.0f - a * a; // da/du
+
+    // SAC gradients:
+    //   ∂L/∂u = α * ∂logπ/∂u + (∂L/∂a) * (da/du)
+    //   ∂logπ/∂u = 2 * tanh(u) = 2a   (from −log(1−tanh²(u)))
+    //   ∂logπ/∂logσ = −1              (from −logσ)
+    stored_mu_grad_output[i] = dL_dlogp[i] * (2.0f * a) + dL_da[i] * tanh_deriv;
+    stored_logstd_grad_output[i] = dL_dlogp[i] * (-1.0f);
   }
 
-  // 2. Backprop to hidden2
+  // 2. Backprop to hidden2 (from both μ and logσ outputs)
   float grad_hidden2[HIDDEN2_SIZE] = {0};
   for (int j = 0; j < HIDDEN2_SIZE; j++) {
     for (int i = 0; i < NUM_ACTIONS; i++) {
@@ -350,13 +429,15 @@ void snn_backward_pass(const sample_trace_t *trace, const float *dL_da,
     }
   }
 
-  // 6. Output weights (use last time step)
+  // 6. Output weights: FULL BPTT over all time steps (average)
   for (int i = 0; i < NUM_ACTIONS; i++) {
     for (int j = 0; j < HIDDEN2_SIZE; j++) {
-      mu_grad[i][j] +=
-          stored_mu_grad_output[i] * trace->hidden2_v[TIME_STEPS - 1][j];
-      logstd_grad[i][j] +=
-          stored_logstd_grad_output[i] * trace->hidden2_v[TIME_STEPS - 1][j];
+      float sum_v = 0.0f;
+      for (int t = 0; t < TIME_STEPS; t++) {
+        sum_v += trace->hidden2_v[t][j];
+      }
+      mu_grad[i][j] += stored_mu_grad_output[i] * (sum_v / TIME_STEPS);
+      logstd_grad[i][j] += stored_logstd_grad_output[i] * (sum_v / TIME_STEPS);
     }
     mu_bias_grad[i] += stored_mu_grad_output[i];
     logstd_bias_grad[i] += stored_logstd_grad_output[i];
@@ -546,21 +627,49 @@ err_t handle_minibatch_query(struct tcp_pcb *tpcb, const uint8_t *payload,
 
 err_t handle_grad_update(struct tcp_pcb *tpcb, const uint8_t *payload,
                          uint32_t len) {
-  // Parse N safely (just for debug)
-  uint32_t N = 0;
-  if (len >= 4) {
-    N = *(uint32_t *)payload;
+  if (len < 4) {
+    xil_printf("GRAD_UPDATE: payload too short\r\n");
+    return ERR_ARG;
   }
-  xil_printf("Rx GRAD_UPDATE (N=%u, len=%u)\r\n", N, len);
 
-  // Send ACK immediately — no backward, no apply_gradients
-  err_t err = send_response(tpcb, MSG_TYPE_ACK, NULL, 0);
-  if (err != ERR_OK) {
-    xil_printf("ACK send failed: %d\r\n", err);
-  } else {
-    xil_printf("ACK sent\r\n");
+  uint32_t N = *(uint32_t *)payload;
+  if (N == 0 || N > batch_size) {
+    xil_printf("GRAD_UPDATE: invalid N=%u (batch_size=%u)\r\n", N, batch_size);
+    return ERR_ARG;
   }
-  return err;
+
+  // Parse gradients: N × (A + 1) floats
+  const float *grads = (const float *)(payload + 4);
+  uint32_t expected_floats = N * (NUM_ACTIONS + 1);
+  if (4 + expected_floats * sizeof(float) != len) {
+    xil_printf("GRAD_UPDATE: size mismatch (got %u, need %u)\r\n", len,
+               4 + expected_floats * 4);
+    return ERR_ARG;
+  }
+
+  // Zero gradients before accumulation
+  memset(fc1_grad, 0, sizeof(fc1_grad));
+  memset(fc2_grad, 0, sizeof(fc2_grad));
+  memset(mu_grad, 0, sizeof(mu_grad));
+  memset(logstd_grad, 0, sizeof(logstd_grad));
+  memset(fc1_bias_grad, 0, sizeof(fc1_bias_grad));
+  memset(fc2_bias_grad, 0, sizeof(fc2_bias_grad));
+  memset(mu_bias_grad, 0, sizeof(mu_bias_grad));
+  memset(logstd_bias_grad, 0, sizeof(logstd_bias_grad));
+
+  // Backward pass for each sample
+  for (uint32_t i = 0; i < N; i++) {
+    const float *dL_da_i = &grads[i * (NUM_ACTIONS + 1)];
+    const float *dL_dlogp_i = &grads[i * (NUM_ACTIONS + 1) + NUM_ACTIONS];
+    snn_backward_pass(&batch_traces[i], dL_da_i, dL_dlogp_i);
+  }
+
+  // Apply once per minibatch
+  apply_gradients();
+
+  xil_printf("GRAD_UPDATE: applied %u samples\r\n", N);
+
+  return send_response(tpcb, MSG_TYPE_ACK, NULL, 0);
 }
 
 // TCP data handling
