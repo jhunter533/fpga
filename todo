@@ -20,3 +20,50 @@ Error Recovery:
 Testing:
 
 
+
+2/15/26:
+Plans:
+PS should have pur IO+Control
+PS does not handle math,weights,neuron states
+PL should have full SNN forward/backwared and SGD
+
+Proposed Vitis Project Structure
+your_project/
+├── src/
+│   ├── main.c                 ← lwIP init, TCP server, main loop
+│   ├── tcp_handlers.c         ← message parsing & dispatch
+│   ├── pl_driver.c            ← AXI register access to PL
+│   └── pl_driver.h
+├── hls/
+│   └── snn_accel/
+│       ├── snn_accel.cpp      ← HLS kernel (forward + backward + SGD)
+│       └── snn_accel_test.cpp
+├── ip/
+│   └── snn_accel.xo           ← Compiled HLS IP
+└── system/
+    └── design_1_wrapper.xsa   ← Vivado-exported platform
+
+PL Hardware Interface:
+HLS kernel (snn_accel) exposes:
+- Control registers:
+  - CTRL (0 is forward,1 is backward)
+  - Status (0 is busy, 1 is ready)
+  - State_IN[n] input states
+  - Grad_DA_IN dL/da
+  - Grad_dlogp_in dL/dlogp
+  - LOGPI_OUT logpi
+  - ACTION_OUT tanh(mu)
+
+use bram block for weights
+ideally use another bram block for grads
+
+PS:
+single threaded event loop
+non blocking lwlp+state flags
+when message arrive->parse->drive PL->return response when PL done
+
+Offload all math onto PL (HLS) including neuron dynamics, SG,BPTT,SGD
+PS to PL driver
+
+so all tcp,lwIP, message framing, message parsing, AXI register I/O, nonblocking wait are on PS
+
