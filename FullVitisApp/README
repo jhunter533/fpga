@@ -1,0 +1,5 @@
+Stuff in this folder was at least partially working using a Vitis applicaiton only running the FPGA (ZU1CG) on PS side not PL. Run bash program while ethernet is connected to FPGA to set ip correctly. Then run the vitis application and start the python program
+
+The python program requires you to be in the fpgaenv a folder back
+
+There is no good way to save the platform from Vitis cause reasons so if you need to make one target the xsa from BASE2 and baremetal and enable lwp or something. Then make an application from Vitis using that platform and use the example helloworld baremetal project.

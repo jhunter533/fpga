@@ -1,0 +1,1 @@
+None of this is tested just ideas for porting the FPGA Vitis application to being TCP separate still and then running the rest as an IP in vivado via HLS synthesis
